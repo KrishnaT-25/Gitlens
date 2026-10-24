@@ -1,4 +1,5 @@
 import json
+import re
 from urllib.parse import quote
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -55,7 +56,12 @@ def answerable_suggestions(db: Session, snapshot_id: str, suggestions: list[str]
     return answerable
 
 def answer(db: Session, snapshot: Snapshot, question: str, history: list[dict]) -> dict:
-    anchors = search(db, snapshot.id, question, settings.max_chunks)
+    asks_technology_stack = bool(re.search(r"\b(tech(?:nology)? stack|technology stack|technologies|tech stack|programming languages?|frameworks?)\b", question, re.IGNORECASE))
+    technologies = (snapshot.summary or {}).get("technologies", []) if asks_technology_stack else []
+    technology_query = " ".join(item for item in technologies if isinstance(item, str)) if isinstance(technologies, list) else ""
+    anchors = search(db, snapshot.id, technology_query, settings.max_chunks) if technology_query else []
+    if not anchors:
+        anchors = search(db, snapshot.id, question, settings.max_chunks)
     if not anchors:
         # Resolve short follow-ups from the latest user question without trusting prior model output.
         prior_questions = [turn.get("content", "") for turn in history[-settings.max_history_turns:] if turn.get("role") == "user"]

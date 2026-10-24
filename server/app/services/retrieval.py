@@ -18,15 +18,33 @@ SYNONYM_GROUPS = (
 SYNONYMS = {term: tuple(other for other in group if other != term) for group in SYNONYM_GROUPS for term in group}
 
 FILE_REFERENCE = re.compile(r"(?<![\w.-])(?:[\w.-]+[\\/])*[\w.-]+\.[A-Za-z0-9]{1,12}(?![\w.-])")
+PATH_LINE_REFERENCE = re.compile(r"(?<![\w.-])((?:[\w.-]+[\\/])*[\w.-]+\.[A-Za-z0-9]{1,12}):L?(\d+)(?!\d)", re.IGNORECASE)
+LINE_REFERENCE = re.compile(r"\b(?:lines?|L)\s*(\d+)(?:\s*(?:-|to)\s*(?:L|line\s*)?(\d+))?\b", re.IGNORECASE)
 
 def _explicit_file_chunks(db: Session, snapshot_id: str, question: str, limit: int) -> list[Chunk]:
     """Prioritize a file explicitly named in the question over broad keyword matches."""
-    references = [match.group(0).replace("\\", "/").lower() for match in FILE_REFERENCE.finditer(question)]
+    line_match = PATH_LINE_REFERENCE.search(question)
+    line_range = None
+    if line_match:
+        references = [line_match.group(1).replace("\\", "/").lower()]
+        line_range = (int(line_match.group(2)), int(line_match.group(2)))
+    else:
+        references = [match.group(0).replace("\\", "/").lower() for match in FILE_REFERENCE.finditer(question)]
+        if not references:
+            # Common repository files such as README have no required extension.
+            references = [name for name in ("readme", "dockerfile", "makefile", "license", "changelog")
+                          if re.search(rf"(?<![\w.-]){name}(?![\w.-])", question, re.IGNORECASE)]
+        match = LINE_REFERENCE.search(question)
+        if match:
+            start = int(match.group(1))
+            line_range = (start, int(match.group(2) or start))
     for reference in references:
         if "/" in reference:
             predicate = func.lower(Chunk.path) == reference
         else:
             predicate = func.lower(Chunk.path).like(f"%/{reference}") | (func.lower(Chunk.path) == reference)
+        if line_range:
+            predicate = predicate & (Chunk.line_start <= line_range[1]) & (Chunk.line_end >= line_range[0])
         chunks = list(db.execute(
             select(Chunk).where(Chunk.snapshot_id == snapshot_id, predicate)
             .order_by(Chunk.line_start).limit(limit)

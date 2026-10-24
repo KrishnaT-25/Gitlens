@@ -83,7 +83,7 @@ function Widget({ repo }) {
         {messages.map((m,i) => <div className={`message ${m.role}`} key={i}><strong>{m.role === 'user' ? 'You' : 'GitLens'}</strong><p>{m.content}</p>{m.citations?.length > 0 && <ul className="citations">{m.citations.map((c,j) => <li key={j}><a href={c.url} target="_blank" rel="noopener noreferrer">{c.path}:L{c.lineStart}-L{c.lineEnd}</a></li>)}</ul>}</div>)}
         {error && <p className="error" role="alert">{error}</p>}
       </div>
-      {snapshot?.status === 'ready' && <form className="foot" onSubmit={ask}><input aria-label="Ask about this repository" value={question} onChange={e => setQuestion(e.target.value)} placeholder="Ask about this codebase"/><button disabled={busy || !question.trim()}>Ask</button></form>}
+      {snapshot?.status === 'ready' && <form className="foot" onPointerDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()} onSubmit={ask}><input aria-label="Ask about this repository" value={question} onChange={e => setQuestion(e.target.value)} onPointerDown={e => { e.stopPropagation(); e.currentTarget.focus(); }} onClick={e => { e.stopPropagation(); e.currentTarget.focus(); }} onKeyDown={e => { e.stopPropagation(); if (e.key === 'Escape') setOpen(false); }} placeholder="Ask about this codebase"/><button disabled={busy || !question.trim()}>Ask</button></form>}
     </section>}
   </>;
 }
