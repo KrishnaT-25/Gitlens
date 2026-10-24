@@ -64,7 +64,10 @@ function Widget({ repo }) {
   }, [open, snapshot?.snapshotId, snapshot?.status]);
   useEffect(() => {
     if (snapshot?.status !== 'ready' || summary) return;
-    api('GET', `/api/snapshots/${snapshot.snapshotId}/summary`).then(x => setSummary(x.summary)).catch(e => setError(e.message));
+    api('GET', `/api/snapshots/${snapshot.snapshotId}/summary`).then(x => {
+      const value = x?.summary;
+      setSummary(value ? { ...value, uncertainty: typeof value.uncertainty === 'string' ? value.uncertainty.trim() : '' } : null);
+    }).catch(e => setError(e.message));
   }, [snapshot?.status, snapshot?.snapshotId, summary]);
   useEffect(() => {
     if (!open || !atBottomRef.current) { if (open) setShowJump(true); return; }
