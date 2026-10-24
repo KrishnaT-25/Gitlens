@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: gitlens-api
+    runtime: python
+    rootDir: server
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.migrate && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: WORKER_MODE
+        value: inprocess
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: DATABASE_URL
+        sync: false
+      - key: SESSION_PEPPER
+        generateValue: true
+      - key: EMAIL_PROVIDER
+        value: disabled
+      - key: GITHUB_OAUTH_CLIENT_ID
+        sync: false
+      - key: GITHUB_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GITHUB_OAUTH_REDIRECT_URI
+        value: https://copoojjfbgbgcnaokahlbopnafkljfkf.chromiumapp.org/github
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: EXTENSION_ORIGIN
+        value: chrome-extension://copoojjfbgbgcnaokahlbopnafkljfkf
+      - key: ADMIN_TOKEN
+        generateValue: true
