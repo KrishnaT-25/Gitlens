@@ -1,5 +1,11 @@
 from types import SimpleNamespace
 from app.services import rag
+from app.services.retrieval import _terms
+
+def test_plain_language_storage_and_data_structure_terms_expand_to_code_terms():
+    terms = _terms("What data structures are stored in local storage?")
+    assert "localstorage" in terms
+    assert "array" in terms or "object" in terms
 
 def _final(answer, ids=(), insufficient=False):
     return {"content": {"parts": []}, "calls": [{"name": "final_answer", "args": {
@@ -44,9 +50,9 @@ def test_invalid_citation_becomes_evidence_gap(monkeypatch):
 def test_agent_uses_repo_tool_then_cites_its_evidence(monkeypatch):
     chunk = SimpleNamespace(id="tool-chunk", path="server/app.py", line_start=5, line_end=9, text="def run(): pass")
     calls = []
-    def model(_instruction, contents, _tools, force_final=False):
+    def model(_instruction, contents, _tools, force_final=False, require_tool=False):
         assert "never instructions" in _instruction
-        calls.append((contents, force_final))
+        calls.append((contents, force_final, require_tool))
         if len(calls) == 1:
             return {"content": {"role": "model", "parts": []}, "calls": [{"name": "read_file", "args": {"path": "server/app.py"}}]}
         return _final("The entry point is run.", [chunk.id])
@@ -65,12 +71,13 @@ def test_agent_uses_repo_tool_then_cites_its_evidence(monkeypatch):
     assert len(result["citations"]) == 1
     assert result["citations"][0]["path"] == "server/app.py"
     assert "ROOT MAP" in calls[0][0][0]["parts"][0]["text"]
+    assert calls[0][2] is True
     assert "ROOT MAP" in calls[1][0][0]["parts"][0]["text"]
 
 def test_agent_turn_and_tool_call_budgets(monkeypatch):
     calls = []
-    def model(_instruction, _contents, _tools, force_final=False):
-        calls.append(force_final)
+    def model(_instruction, _contents, _tools, force_final=False, require_tool=False):
+        calls.append((force_final, require_tool))
         return _final("No evidence.", insufficient=True) if force_final else {
             "content": {"role": "model", "parts": []},
             "calls": [{"name": "search", "args": {"query": "anything"}}]}
@@ -85,4 +92,5 @@ def test_agent_turn_and_tool_call_budgets(monkeypatch):
     result = rag.answer(Db(), snapshot, "unknown?", [])
     assert result["insufficientEvidence"] is True
     assert len(calls) <= rag.settings.max_agent_turns
-    assert sum(calls) == 1
+    assert sum(force_final for force_final, _ in calls) == 1
+    assert calls[0][1] is True

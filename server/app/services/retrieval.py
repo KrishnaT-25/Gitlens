@@ -12,11 +12,14 @@ SYNONYM_GROUPS = (
     ("auth", "authentication", "authorization", "login", "logout", "session", "sessions"),
     ("bug", "bugs", "error", "errors", "exception", "exceptions", "failure", "failures"),
     ("class", "classes", "struct", "structs", "type", "types"),
+    ("structure", "structures", "array", "arrays", "object", "objects", "map", "maps", "dictionary", "dict", "collection", "collections"),
     ("config", "configuration", "settings", "environment"),
     ("function", "functions", "method", "methods", "def", "func"),
     ("test", "tests", "testing", "spec", "specs"),
     ("dependency", "dependencies", "package", "packages", "library", "libraries"),
     ("database", "db", "sql", "postgres", "postgresql"),
+    ("local", "localstorage", "storage", "persist", "persistence"),
+    ("session", "sessionstorage", "browser", "storage"),
 )
 SYNONYMS = {term: tuple(other for other in group if other != term) for group in SYNONYM_GROUPS for term in group}
 

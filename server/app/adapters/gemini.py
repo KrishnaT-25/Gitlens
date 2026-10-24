@@ -47,7 +47,7 @@ def generate_json(instruction: str, prompt: str, schema: dict, max_tokens: int =
     except (KeyError, IndexError, ValueError, TypeError):
         raise AppError("gemini_response", "AI service returned an invalid response. Try again.", 502)
 
-def generate_tool_turn(instruction: str, contents: list[dict], declarations: list[dict], force_final: bool = False) -> dict:
+def generate_tool_turn(instruction: str, contents: list[dict], declarations: list[dict], force_final: bool = False, require_tool: bool = False) -> dict:
     """One bounded Gemini function-calling turn. Returns the provider content and function calls."""
     if not settings.gemini_api_key:
         raise AppError("gemini_unconfigured", "Repository analysis is not configured.", 503)
@@ -55,6 +55,8 @@ def generate_tool_turn(instruction: str, contents: list[dict], declarations: lis
     config = {"maxOutputTokens": 3000, "temperature": 0.1, "thinkingConfig": {"thinkingLevel": "low"}}
     if force_final:
         config["functionCallingConfig"] = {"mode": "ANY", "allowedFunctionNames": ["final_answer"]}
+    elif require_tool:
+        config["functionCallingConfig"] = {"mode": "ANY", "allowedFunctionNames": ["search", "read_file", "list_dir", "find_references"]}
     body = {"systemInstruction": {"parts": [{"text": instruction}]}, "contents": contents,
             "tools": [{"functionDeclarations": declarations}], "toolConfig": {"functionCallingConfig": config.pop("functionCallingConfig", {"mode": "AUTO"})},
             "generationConfig": config}

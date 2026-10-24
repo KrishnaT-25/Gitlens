@@ -1,3 +1,4 @@
+import json
 import httpx
 import pytest
 from app.adapters import gemini
@@ -29,6 +30,27 @@ def test_gemini_timeout_is_safe(monkeypatch):
     with pytest.raises(AppError) as error:
         gemini.generate_json("instruction", "evidence", {"type": "OBJECT"})
     assert error.value.code == "gemini_timeout"
+
+@pytest.mark.parametrize("force_final,require_tool,mode,allowed", [
+    (False, True, "ANY", ["search", "read_file", "list_dir", "find_references"]),
+    (True, True, "ANY", ["final_answer"]),
+])
+def test_agent_turn_requires_repository_inspection_before_final(monkeypatch, force_final, require_tool, mode, allowed):
+    monkeypatch.setattr(gemini.settings, "gemini_api_key", "test-key")
+    request_body = {}
+    response_body = {"candidates": [{"content": {"role": "model", "parts": [
+        {"functionCall": {"name": "search", "args": {"query": "localStorage"}}}
+    ]}}]}
+    real_client = httpx.Client
+    def handle(request):
+        request_body.update(json.loads(request.content))
+        return httpx.Response(200, json=response_body)
+    transport = httpx.MockTransport(handle)
+    monkeypatch.setattr(gemini.httpx, "Client", lambda **kwargs: real_client(transport=transport, **kwargs))
+    gemini.generate_tool_turn("instruction", [], [], force_final=force_final, require_tool=require_tool)
+    config = request_body["toolConfig"]["functionCallingConfig"]
+    assert config["mode"] == mode
+    assert config["allowedFunctionNames"] == allowed
 
 def test_worker_dispatch_targets_configured_workflow(monkeypatch):
     monkeypatch.setattr(workflow.settings, "worker_dispatch_repo", "owner/gitlens")

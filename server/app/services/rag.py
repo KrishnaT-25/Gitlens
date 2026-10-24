@@ -108,7 +108,8 @@ def answer(db: Session, snapshot: Snapshot, question: str, history: list[dict]) 
     for turn in range(settings.max_agent_turns):
         force_final = turn == settings.max_agent_turns - 1 or calls_used >= settings.max_agent_tool_calls - 1
         result = generate_tool_turn(instruction, contents, TOOL_DECLARATIONS,
-                                    force_final=force_final)
+                                    force_final=force_final,
+                                    require_tool=turn == 0 and not force_final)
         contents.append(result["content"])
         calls = result["calls"]
         if not calls:
