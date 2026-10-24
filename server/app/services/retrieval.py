@@ -17,6 +17,24 @@ SYNONYM_GROUPS = (
 )
 SYNONYMS = {term: tuple(other for other in group if other != term) for group in SYNONYM_GROUPS for term in group}
 
+FILE_REFERENCE = re.compile(r"(?<![\w.-])(?:[\w.-]+[\\/])*[\w.-]+\.[A-Za-z0-9]{1,12}(?![\w.-])")
+
+def _explicit_file_chunks(db: Session, snapshot_id: str, question: str, limit: int) -> list[Chunk]:
+    """Prioritize a file explicitly named in the question over broad keyword matches."""
+    references = [match.group(0).replace("\\", "/").lower() for match in FILE_REFERENCE.finditer(question)]
+    for reference in references:
+        if "/" in reference:
+            predicate = func.lower(Chunk.path) == reference
+        else:
+            predicate = func.lower(Chunk.path).like(f"%/{reference}") | (func.lower(Chunk.path) == reference)
+        chunks = list(db.execute(
+            select(Chunk).where(Chunk.snapshot_id == snapshot_id, predicate)
+            .order_by(Chunk.line_start).limit(limit)
+        ).scalars())
+        if chunks:
+            return chunks
+    return []
+
 def _terms(question: str) -> list[str]:
     terms = []
     for raw in re.findall(r"[A-Za-z0-9_]{2,}", question):
@@ -31,6 +49,9 @@ def _terms(question: str) -> list[str]:
     return terms
 
 def search(db: Session, snapshot_id: str, question: str, limit: int = 8) -> list[Chunk]:
+    explicit_file = _explicit_file_chunks(db, snapshot_id, question, limit)
+    if explicit_file:
+        return explicit_file
     terms = _terms(question)
     if not terms:
         return []
