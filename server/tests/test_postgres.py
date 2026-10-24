@@ -116,6 +116,8 @@ def test_worker_retries_and_rejects_stale_lease(monkeypatch):
     assert same_job_id == job_id and old_token != new_token
     monkeypatch.setattr(jobs, "download_archive", lambda *_args: make_zip("root/app.py", "def answer(): return 42"))
     monkeypatch.setattr(jobs, "make_summary", lambda *_args: {"purpose": "test"})
+    monkeypatch.setattr(jobs, "summarize_repository_nodes", lambda *_args: None)
+    monkeypatch.setattr(jobs, "_embed_staged_chunks", lambda *_args: False)
     jobs.process(job_id, old_token)
     with SessionLocal() as db:
         assert db.get(Snapshot, snapshot_id).status == "indexing"
@@ -181,7 +183,16 @@ def test_authenticated_end_to_end_contract(monkeypatch):
     monkeypatch.setattr(snapshots, "resolve_repo", lambda _repo: ("o", "r", "main", "d" * 40))
     monkeypatch.setattr(jobs, "download_archive", lambda *_args: make_zip("root/app.py", "def answer(): return 42"))
     monkeypatch.setattr(jobs, "make_summary", lambda *_args: {"purpose": "A test project", "components": [], "entrypoints": ["app.py"], "technologies": ["Python"], "uncertainty": "", "suggestedQuestions": []})
-    monkeypatch.setattr(rag, "generate_json", lambda *_args: {"answer": "The answer is in app.py.", "citedChunkIds": [next(iter(_args[1].split("CHUNK ")[1].split(" ")))], "insufficientEvidence": False})
+    monkeypatch.setattr(jobs, "summarize_repository_nodes", lambda *_args: None)
+    monkeypatch.setattr(jobs, "_embed_staged_chunks", lambda *_args: False)
+    def fake_tool_turn(_instruction, contents, _tools, **_kwargs):
+        import re
+        text = contents[0]["parts"][0]["text"]
+        match = re.search(r"CHUNK ([0-9a-f-]+) FILE", text)
+        return {"content": {"role": "model", "parts": []}, "calls": [{"name": "final_answer", "args": {
+            "answer": "The answer is in app.py.", "citedChunkIds": [match.group(1)] if match else [],
+            "insufficientEvidence": not bool(match)}}]}
+    monkeypatch.setattr(rag, "generate_tool_turn", fake_tool_turn)
     client = TestClient(app)
     assert client.get("/healthz").status_code == 200
     challenge = client.post("/api/auth/code", json={"email": "user@example.com"}).json()["challengeId"]

@@ -14,6 +14,17 @@ class Settings(BaseSettings):
     email_from: str = "GitLens <login@example.com>"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.5-flash-lite"
+    gemini_embedding_model: str = "gemini-embedding-2"
+    embedding_dimensions: int = 768
+    embedding_batch_size: int = 32
+    summary_batch_size: int = 20
+    max_summary_calls: int = 4
+    index_schema_version: int = 2
+    max_repo_map_chars: int = 12000
+    max_tool_output_chars: int = 12000
+    max_tool_file_lines: int = 200
+    max_agent_turns: int = 4
+    max_agent_tool_calls: int = 6
     github_token: str = ""
     github_oauth_client_id: str = ""
     github_oauth_client_secret: str = ""
@@ -34,6 +45,7 @@ class Settings(BaseSettings):
     max_file_bytes: int = 256_000
     max_text_bytes: int = 20_000_000
     max_chunks_per_snapshot: int = 5_000
+    max_symbol_references: int = 200_000
     max_chunks: int = 8
     max_context_chunks: int = 16
     max_context_chars: int = 56_000
@@ -48,8 +60,12 @@ class Settings(BaseSettings):
     def validate_production(self):
         if self.database_url.startswith("postgresql://"):
             self.database_url = self.database_url.replace("postgresql://", "postgresql+psycopg://", 1)
-        if self.max_chunks < 1 or self.max_context_chunks < self.max_chunks or self.max_context_chars < 1 or self.max_chunks_per_snapshot < 1:
+        if self.max_chunks < 1 or self.max_context_chunks < self.max_chunks or self.max_context_chars < 1 or self.max_chunks_per_snapshot < 1 or self.max_symbol_references < 1:
             raise ValueError("RAG retrieval limits are invalid")
+        if self.embedding_dimensions != 768 or not 1 <= self.embedding_batch_size <= 100 or self.summary_batch_size < 1 or self.max_summary_calls < 1:
+            raise ValueError("Repository index limits are invalid")
+        if not 1 <= self.max_agent_turns <= 4 or not 1 <= self.max_agent_tool_calls <= 6 or self.max_tool_file_lines < 1 or self.max_tool_output_chars < 1000 or self.max_repo_map_chars < 1000:
+            raise ValueError("Agent limits are invalid")
         if self.db_connect_attempts < 1 or self.db_connect_backoff_seconds < 0 or self.db_connect_timeout_seconds < 1 or self.worker_shutdown_timeout_seconds < 0:
             raise ValueError("Database retry and shutdown limits are invalid")
         if self.worker_mode not in {"separate", "inprocess", "actions"}:
