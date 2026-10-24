@@ -43,6 +43,11 @@ def test_code_chunks_include_symbol_metadata():
     assert chunk.language == "python"
     assert any(symbol.name == "greet" and symbol.is_definition for symbol in parsed.symbols)
 
+def test_indexed_line_count_does_not_add_phantom_line_for_trailing_newline():
+    parsed = parse_repository(archive({"root/README.md": "single line\n"}))
+    file = parsed.files[0]
+    assert file.line_count == len(file.content.splitlines()) == 1
+
 def test_markdown_sections_are_chunked_with_heading_metadata():
     parsed = parse_repository(archive({"root/README.md": "# Intro\nWelcome\n## Install\nRun setup\n"}))
     sections = [c.symbol_path for c in parsed.chunks]

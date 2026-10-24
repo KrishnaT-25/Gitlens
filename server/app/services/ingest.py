@@ -300,8 +300,9 @@ def parse_repository(data: bytes) -> ParsedRepository:
             language = EXTENSION_LANGUAGE.get(PurePosixPath(path).suffix.lower())
             file_chunks, file_symbols = _parse_code(path, content, language)
             symbol_names = list(dict.fromkeys(s.name for s in file_symbols if s.is_definition))
-            summary = f"{language or 'text'} file ({content.count(chr(10)) + 1} lines)" + (f"; declarations: {', '.join(symbol_names[:40])}" if symbol_names else "")
-            files.append(IndexedFile(path, content, language, summary, content.count("\n") + 1, len(raw)))
+            line_count = len(content.splitlines())
+            summary = f"{language or 'text'} file ({line_count} lines)" + (f"; declarations: {', '.join(symbol_names[:40])}" if symbol_names else "")
+            files.append(IndexedFile(path, content, language, summary, line_count, len(raw)))
             chunks.extend(file_chunks)
             remaining_symbols = max(0, settings.max_symbol_references - len(symbols))
             if len(file_symbols) > remaining_symbols:

@@ -34,6 +34,18 @@ def _bounded(payload: dict) -> dict:
         return {"truncated": True}
     return payload
 
+def _line_window(content: str, start_value, end_value, max_lines: int) -> tuple[list[str], int, int]:
+    lines = content.splitlines()
+    if not lines:
+        return lines, 0, 0
+    try:
+        start = min(len(lines), max(1, int(start_value or 1)))
+        end = min(len(lines), max(start, int(end_value or start + max_lines - 1)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AppError("invalid_tool_range", "Repository line range is invalid.", 400) from exc
+    end = min(end, start + max_lines - 1)
+    return lines, start, end
+
 def execute_tool(db: Session, snapshot: Snapshot, name: str, args: dict, evidence: dict[str, Chunk]) -> dict:
     version = snapshot.index_version
     if name == "search":
@@ -60,13 +72,9 @@ def execute_tool(db: Session, snapshot: Snapshot, name: str, args: dict, evidenc
             SnapshotFile.index_version == version, SnapshotFile.path == path)).scalar_one_or_none()
         if not file:
             return {"error": "file_not_indexed", "path": path}
-        try:
-            start = min(file.line_count, max(1, int(args.get("start_line") or 1)))
-            end = min(file.line_count, max(start, int(args.get("end_line") or start + settings.max_tool_file_lines - 1)))
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise AppError("invalid_tool_range", "Repository line range is invalid.", 400) from exc
-        end = min(end, start + settings.max_tool_file_lines - 1)
-        lines = file.content.splitlines()
+        lines, start, end = _line_window(file.content, args.get("start_line"), args.get("end_line"), settings.max_tool_file_lines)
+        if not lines:
+            return {"path": path, "lineStart": 0, "lineEnd": 0, "text": "", "evidence": []}
         excerpts = db.execute(select(Chunk).where(Chunk.snapshot_id == snapshot.id,
             Chunk.index_version == version, Chunk.path == path, Chunk.line_start <= end, Chunk.line_end >= start)
             .order_by(Chunk.line_start)).scalars().all()

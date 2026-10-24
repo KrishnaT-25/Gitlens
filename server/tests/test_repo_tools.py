@@ -18,3 +18,11 @@ def test_tool_json_output_stays_under_configured_size(monkeypatch):
     result = repo_tools._bounded({"text": "x" * 5000})
     assert result["truncated"] is True
     assert len(json.dumps(result, ensure_ascii=False)) <= 1000
+
+def test_read_file_window_uses_actual_lines_when_file_ends_with_newline():
+    lines, start, end = repo_tools._line_window("only line\n", 1, 2, 200)
+    assert lines == ["only line"]
+    assert (start, end) == (1, 1)
+
+def test_read_file_window_handles_empty_content():
+    assert repo_tools._line_window("", 1, 1, 200) == ([], 0, 0)
