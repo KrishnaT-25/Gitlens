@@ -18,7 +18,7 @@ depends_on = None
 
 def upgrade():
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    op.execute("DO $$ BEGIN CREATE EXTENSION IF NOT EXISTS pg_search; EXCEPTION WHEN undefined_file THEN RAISE NOTICE 'pg_search unavailable; BM25 will use PostgreSQL FTS fallback'; END $$")
+    op.execute("DO $$ BEGIN CREATE EXTENSION IF NOT EXISTS pg_search; EXCEPTION WHEN undefined_file OR insufficient_privilege THEN RAISE NOTICE 'pg_search unavailable or not permitted; BM25 will use PostgreSQL FTS fallback'; END $$")
     op.add_column("snapshots", sa.Column("index_version", sa.Integer(), nullable=False, server_default="1"))
     op.add_column("snapshots", sa.Column("index_report", sa.JSON(), nullable=True))
     op.add_column("chunks", sa.Column("index_version", sa.Integer(), nullable=False, server_default="1"))
