@@ -54,11 +54,13 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(comparisons)
     print("\nExperiment comparison")
-    print(f"{'name':<14} {'top_k':>5} {'hit@10':>8} {'recall@10':>10} {'precision@10':>13} {'mrr':>8} {'ndcg@10':>9}")
-    print("-" * 75)
+    print(f"{'name':<14} {'top_k':>5} {'hit@10':>8} {'recall@10':>10} {'file_hit@10':>12} "
+          f"{'precision@10':>13} {'mrr':>8} {'ndcg@10':>9}")
+    print("-" * 89)
     for row in comparisons:
         print(f"{row['name']:<14} {row['top_k']:>5} {row['hit_rate@10']:>8.4f} "
-              f"{row['recall@10']:>10.4f} {row['precision@10']:>13.4f} "
+              f"{row['recall@10']:>10.4f} {row['file_hit_rate@10']:>12.4f} "
+              f"{row['precision@10']:>13.4f} "
               f"{row['mrr']:>8.4f} {row['ndcg@10']:>9.4f}")
     print(f"\nComparison table: {table_path}")
 

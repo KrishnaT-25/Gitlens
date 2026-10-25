@@ -25,6 +25,14 @@ def metrics_at_k(retrieved_ids: Sequence[str], relevant_ids: Iterable[str], k: i
     }
 
 
+def file_hit_rate_at_k(retrieved_paths: Sequence[str], relevant_paths: Iterable[str], k: int) -> float:
+    """Return 1 when any of the expected source files appears in the top ``k`` chunks."""
+    if k < 1:
+        raise ValueError("k must be positive")
+    relevant = set(relevant_paths)
+    return float(bool(relevant.intersection(retrieved_paths[:k])))
+
+
 def summarize(rows: Sequence[dict], cutoffs: Sequence[int] = (1, 3, 5, 10)) -> dict[str, float]:
     """Macro-average per-question metrics and report MRR over each retrieved list."""
     if not rows:
@@ -34,5 +42,7 @@ def summarize(rows: Sequence[dict], cutoffs: Sequence[int] = (1, 3, 5, 10)) -> d
         for metric in ("hit_rate", "recall", "precision", "ndcg"):
             key = f"{metric}@{k}"
             summary[key] = sum(row["metrics"][str(k)][metric] for row in rows) / len(rows)
+        key = f"file_hit_rate@{k}"
+        summary[key] = sum(row["file_hit_rate"][str(k)] for row in rows) / len(rows)
     summary["mrr"] = sum(row["mrr"] for row in rows) / len(rows)
     return summary

@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eval.common import chunk_catalog, load_config, read_jsonl, select_snapshot, validate_profile
-from eval.metrics import metrics_at_k, summarize
+from eval.metrics import file_hit_rate_at_k, metrics_at_k, summarize
 from eval.retriever import retrieve
 
 CUTOFFS = (1, 3, 5, 10)
@@ -23,17 +23,26 @@ CUTOFFS = (1, 3, 5, 10)
 
 def evaluate(testset: list[dict[str, Any]], snapshot_id: str, top_k: int) -> list[dict[str, Any]]:
     """Retrieve for every question and attach per-question relevance metrics."""
+    expected_ids = {chunk_id for item in testset for chunk_id in item["relevant_chunk_ids"]}
+    catalog = chunk_catalog(snapshot_id, expected_ids)
+    missing_ids = expected_ids - catalog.keys()
+    if missing_ids:
+        raise ValueError(f"Test set contains {len(missing_ids)} relevant chunk IDs absent from snapshot {snapshot_id}")
     evaluated = []
     for index, item in enumerate(testset, 1):
         retrieved = retrieve(item["question"], top_k, snapshot_id)
         ids = [chunk["id"] for chunk in retrieved]
         relevant = set(item["relevant_chunk_ids"])
+        expected_paths = {catalog[chunk_id]["path"] for chunk_id in relevant}
         per_k = {str(k): metrics_at_k(ids, relevant, k) for k in CUTOFFS}
+        file_per_k = {str(k): file_hit_rate_at_k([chunk["path"] for chunk in retrieved], expected_paths, k)
+                      for k in CUTOFFS}
         first_rank = next((rank for rank, chunk_id in enumerate(ids, 1) if chunk_id in relevant), None)
         evaluated.append({"question": item["question"], "reference_answer": item["reference_answer"],
             "relevant_chunk_ids": item["relevant_chunk_ids"], "retrieved": retrieved,
             "retrieved_ids": ids, "first_relevant_rank": first_rank,
-            "metrics": per_k, "mrr": 1 / first_rank if first_rank else 0.0})
+            "metrics": per_k, "file_hit_rate": file_per_k,
+            "mrr": 1 / first_rank if first_rank else 0.0})
         print(f"[{index}/{len(testset)}] rank={first_rank or 'miss'} {item['question'][:100]}")
     return evaluated
 
@@ -49,6 +58,7 @@ def save_results(rows: list[dict[str, Any]], summary: dict[str, Any], output_dir
               "first_relevant_rank", "mrr"]
     for k in CUTOFFS:
         fields.extend(f"{metric}@{k}" for metric in ("hit_rate", "recall", "precision", "ndcg"))
+        fields.append(f"file_hit_rate@{k}")
     with csv_path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
@@ -60,6 +70,7 @@ def save_results(rows: list[dict[str, Any]], summary: dict[str, Any], output_dir
             for k in CUTOFFS:
                 record.update({f"{metric}@{k}": row["metrics"][str(k)][metric]
                                for metric in ("hit_rate", "recall", "precision", "ndcg")})
+                record[f"file_hit_rate@{k}"] = row["file_hit_rate"][str(k)]
             writer.writerow(record)
     worst = sorted(rows, key=lambda row: (row["mrr"], row["metrics"]["10"]["ndcg"],
         row["metrics"]["10"]["recall"], row["question"]))[:10]
@@ -80,8 +91,8 @@ def save_results(rows: list[dict[str, Any]], summary: dict[str, Any], output_dir
 def print_summary(summary: dict[str, float]) -> None:
     """Print a compact aligned metric table."""
     print("\nIR evaluation summary")
-    print(f"{'Metric':<18} {'Score':>8}")
-    print("-" * 28)
+    print(f"{'Metric':<24} {'Score':>8}")
+    print("-" * 34)
     for name, value in summary.items():
         print(f"{name:<18} {value:>8.4f}")
 

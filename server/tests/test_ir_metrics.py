@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pytest
-from eval.metrics import metrics_at_k, summarize
+from eval.metrics import file_hit_rate_at_k, metrics_at_k, summarize
 
 
 def test_metrics_hand_checked_for_relevant_chunks_at_ranks_two_and_three():
@@ -27,10 +27,23 @@ def test_metrics_for_single_hit_at_rank_two():
 
 
 def test_summary_macro_averages_questions_and_rejects_empty_input():
-    first = {"metrics": {"1": metrics_at_k(["a"], {"a"}, 1)}, "mrr": 1.0}
-    second = {"metrics": {"1": metrics_at_k(["x"], {"a"}, 1)}, "mrr": 0.0}
+    first = {"metrics": {"1": metrics_at_k(["a"], {"a"}, 1)},
+             "file_hit_rate": {"1": 1.0}, "mrr": 1.0}
+    second = {"metrics": {"1": metrics_at_k(["x"], {"a"}, 1)},
+              "file_hit_rate": {"1": 0.0}, "mrr": 0.0}
     assert summarize([first, second], cutoffs=(1,)) == pytest.approx({
-        "hit_rate@1": 0.5, "recall@1": 0.5, "precision@1": 0.5, "ndcg@1": 0.5, "mrr": 0.5,
+        "hit_rate@1": 0.5, "recall@1": 0.5, "precision@1": 0.5, "ndcg@1": 0.5,
+        "file_hit_rate@1": 0.5, "mrr": 0.5,
     })
     with pytest.raises(ValueError):
         summarize([])
+
+
+def test_file_hit_rate_accepts_correct_file_even_when_chunk_is_not_relevant():
+    assert file_hit_rate_at_k(["src/auth.py", "README.md"], {"src/auth.py"}, 1) == 1.0
+    assert file_hit_rate_at_k(["README.md", "src/auth.py"], {"src/auth.py"}, 1) == 0.0
+
+
+def test_file_hit_rate_rejects_non_positive_cutoff():
+    with pytest.raises(ValueError):
+        file_hit_rate_at_k(["src/auth.py"], {"src/auth.py"}, 0)

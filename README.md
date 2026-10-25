@@ -42,5 +42,6 @@ Results go to timestamped files in `eval/results/` (ignored by Git): per-questio
 - **Precision@k**: relevant results divided by *k*.
 - **MRR**: average reciprocal rank of the first relevant result; higher rewards finding evidence early.
 - **nDCG@k**: relevance gain discounted by rank and normalized against an ideal ordering; higher rewards placing all relevant evidence near the top.
+- **File Hit Rate@k**: fraction of questions where at least one expected source file appears in the top *k* chunks, even if the exact judged chunk did not. It can reveal chunk-boundary misses that chunk-level recall cannot distinguish.
 
 Run metric unit tests with `python -m pytest tests/test_ir_metrics.py` from `server/`.
