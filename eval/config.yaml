@@ -1,0 +1,17 @@
+# Snapshot-specific indexing stays fixed. Change chunking or embedding model only
+# after reindexing a snapshot with those settings; the evaluator rejects mismatches.
+snapshot_id: ""
+testset_path: eval/ir_testset.jsonl
+results_dir: eval/results
+chunk_size_lines: 80
+chunk_overlap_lines: 0
+embedding_model: gemini-embedding-2
+top_k: 10
+
+experiments:
+  - name: top-3
+    top_k: 3
+  - name: top-5
+    top_k: 5
+  - name: top-10
+    top_k: 10

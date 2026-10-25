@@ -12,3 +12,35 @@ An in-page assistant for public GitHub repositories. The Chrome extension is Rea
 6. Visit a public GitHub repository and use **Continue with GitHub**. The OAuth app requests no scopes and GitLens stores its own session token; it does not retain the GitHub access token.
 
 Run backend tests with `python -m pytest` and extension tests with `npm test`. No-card hosted setup is in [`DEPLOY.md`](DEPLOY.md); operating limits are in `docs/operations.md`.
+
+## Information-retrieval evaluation
+
+The offline IR evaluator measures retrieval independently of Gemini's answer. It calls the same snapshot-scoped hybrid retriever used by chat and scores returned chunk IDs against human-reviewed `relevant_chunk_ids` in `eval/ir_testset.jsonl`. Run these commands from `server/` so the existing `server/.env` settings are loaded:
+
+```powershell
+$env:GITLENS_EVAL_SNAPSHOT_ID = "<ready-snapshot-id>"
+# Optional for test-set generation; read from the environment, never committed.
+$env:GEMINI_API_KEY = "<your-key>"
+python ..\eval\generate_testset.py --count 50 --export-for-review
+```
+
+Review `eval/manual_review.jsonl`, correct weak or unsupported questions and answers, then run:
+
+```powershell
+python ..\eval\run_ir_eval.py
+python ..\eval\compare_configs.py
+```
+
+The generator samples distinct indexed chunks and asks Gemini for one grounded question/reference answer per chunk. The generated test set is a draft: verify the questions, answers, and source chunk IDs before treating the metrics as a quality signal. `--export-for-review PATH` selects another review file; `--snapshot-id`, `--output`, and `--count` can override defaults. The API key comes from `GEMINI_API_KEY` through server settings.
+
+`eval/config.yaml` selects the snapshot, test set, results directory, top-k, chunk size/overlap profile, embedding model, and comparison variants. Current production indexes use Tree-sitter/section chunks with 80-line/6,000-character fallback windows and no overlap. Index configuration is not persisted per snapshot yet, so this evaluator accepts only that current chunk profile and the embedding model already stored with the snapshot. It deliberately rejects chunk-size, overlap, or embedding-model variants rather than pretending to reindex; compare retrieval top-k values now. True indexing experiments need separately versioned indexes and reindexing.
+
+Results go to timestamped files in `eval/results/` (ignored by Git): per-question CSV includes retrieved chunk IDs/scores and first relevant rank; summary JSON includes the aggregate metrics and ten worst cases with expected and retrieved locations; config comparisons write one aggregate CSV. Metrics are macro-averaged across questions:
+
+- **Hit Rate@k**: fraction of questions with at least one relevant chunk in the first *k* results.
+- **Recall@k**: fraction of each question's relevant chunks retrieved in the first *k*.
+- **Precision@k**: relevant results divided by *k*.
+- **MRR**: average reciprocal rank of the first relevant result; higher rewards finding evidence early.
+- **nDCG@k**: relevance gain discounted by rank and normalized against an ideal ordering; higher rewards placing all relevant evidence near the top.
+
+Run metric unit tests with `python -m pytest tests/test_ir_metrics.py` from `server/`.

@@ -11,3 +11,5 @@ node_modules/
 dist/
 *.pyc
 *.egg-info/
+eval/results/*
+!eval/results/.gitkeep
