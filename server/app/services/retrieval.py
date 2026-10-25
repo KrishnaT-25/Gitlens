@@ -136,14 +136,14 @@ def expand_context(db: Session, snapshot_id: str, anchors: list[Chunk], limit: i
     context = [entry[1] for entry in sorted(candidates.values(), key=lambda entry: (entry[0], entry[1].path, entry[1].line_start))]
     return sorted([*anchors, *context[:max(0, limit - len(anchors))]], key=lambda chunk: (chunk.path, chunk.line_start))
 
-def hybrid_search(db: Session, snapshot_id: str, question: str, limit: int = 8) -> list[Chunk]:
-    """Snapshot-scoped BM25/FTS + vector candidates, fused and locally reranked."""
+def hybrid_search_scored(db: Session, snapshot_id: str, question: str, limit: int = 8) -> list[tuple[Chunk, float]]:
+    """Return snapshot-scoped ranked chunks and their reciprocal-rank/local-rerank scores."""
     snapshot = db.get(Snapshot, snapshot_id)
     if not snapshot:
         return []
     exact = _explicit_file_chunks(db, snapshot_id, question, limit)
     if exact:
-        return exact
+        return [(chunk, 1.0 / rank) for rank, chunk in enumerate(exact, 1)]
 
     candidate_limit = min(80, max(limit * 6, 24))
     bm25_ids: list[str] = []
@@ -227,4 +227,8 @@ def hybrid_search(db: Session, snapshot_id: str, question: str, limit: int = 8) 
             selected.append(chunk)
             if len(selected) >= limit:
                 break
-    return selected
+    return [(chunk, ranks[chunk.id]) for chunk in selected]
+
+def hybrid_search(db: Session, snapshot_id: str, question: str, limit: int = 8) -> list[Chunk]:
+    """Compatibility wrapper returning chunks in the existing hybrid rank order."""
+    return [chunk for chunk, _score in hybrid_search_scored(db, snapshot_id, question, limit)]
