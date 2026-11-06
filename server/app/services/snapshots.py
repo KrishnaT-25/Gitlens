@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
@@ -7,9 +8,16 @@ from app.models import Repository, Snapshot, Job, now
 from app.quotas import consume
 from app.adapters.github import parse_repo_url, resolve_repo
 
-def submit(db: Session, url: str, user_id: str) -> Snapshot:
+@dataclass(frozen=True)
+class Submission:
+    snapshot: Snapshot
+    ref: str
+
+
+def submit(db: Session, url: str, user_id: str) -> Submission:
     repo_url = parse_repo_url(url)
-    owner, name, branch, sha = resolve_repo(repo_url)
+    resolved = resolve_repo(repo_url)
+    owner, name, branch, sha = resolved.owner, resolved.name, resolved.default_branch, resolved.sha
     repo_stmt = insert(Repository).values(owner=owner, name=name, canonical_url=f"https://github.com/{owner}/{name}", default_branch=branch)
     repo_stmt = repo_stmt.on_conflict_do_update(index_elements=[Repository.owner, Repository.name], set_={"default_branch": branch}).returning(Repository.id)
     repo_id = db.execute(repo_stmt).scalar_one()
@@ -21,7 +29,7 @@ def submit(db: Session, url: str, user_id: str) -> Snapshot:
     else:
         snapshot_id = db.execute(select(Snapshot.id).where(Snapshot.repository_id == repo_id, Snapshot.sha == sha)).scalar_one()
     db.commit()
-    return db.get(Snapshot, snapshot_id)
+    return Submission(db.get(Snapshot, snapshot_id), resolved.ref)
 
 def get_snapshot(db: Session, snapshot_id: str) -> Snapshot:
     snapshot = db.get(Snapshot, snapshot_id)

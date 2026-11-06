@@ -12,6 +12,7 @@ from app.main import app
 from app.services import auth, snapshots, jobs, rag
 from app.services.retrieval import search, hybrid_search, hybrid_search_scored
 from app.errors import AppError
+from app.adapters.github import ResolvedRepository
 
 pytestmark = pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="PostgreSQL integration database not configured")
 
@@ -64,10 +65,10 @@ def test_github_oauth_identity_session_and_repeat_login(monkeypatch):
         assert db.scalar(select(func.count()).select_from(User)) == 1
 
 def test_simultaneous_submission_creates_one_snapshot_and_job(monkeypatch):
-    monkeypatch.setattr(snapshots, "resolve_repo", lambda _repo: ("owner", "repo", "main", "a" * 40))
+    monkeypatch.setattr(snapshots, "resolve_repo", lambda _repo: ResolvedRepository("owner", "repo", "main", "a" * 40, "refs/heads/main"))
     def submit_once(_):
         with SessionLocal() as db:
-            return snapshots.submit(db, "https://github.com/owner/repo", "user1").id
+            return snapshots.submit(db, "https://github.com/owner/repo", "user1").snapshot.id
     with ThreadPoolExecutor(max_workers=4) as pool:
         ids = list(pool.map(submit_once, range(4)))
     assert len(set(ids)) == 1
@@ -75,6 +76,18 @@ def test_simultaneous_submission_creates_one_snapshot_and_job(monkeypatch):
         assert db.scalar(select(func.count()).select_from(Snapshot)) == 1
         assert db.scalar(select(func.count()).select_from(Job)) == 1
         assert db.scalar(select(Quota.count).where(Quota.scope == "user:user1", Quota.action == "snapshots")) == 1
+
+
+def test_branch_and_tag_aliases_share_snapshot_but_keep_request_ref(monkeypatch):
+    refs = iter(["refs/heads/develop", "refs/tags/v1.0"])
+    monkeypatch.setattr(snapshots, "resolve_repo", lambda _repo: ResolvedRepository("o", "r", "main", "a" * 40, next(refs)))
+    with SessionLocal() as db:
+        branch = snapshots.submit(db, "https://github.com/o/r/tree/develop", "user")
+        tag = snapshots.submit(db, "https://github.com/o/r/tree/v1.0", "user")
+        assert branch.snapshot.id == tag.snapshot.id
+        assert branch.ref == "refs/heads/develop" and tag.ref == "refs/tags/v1.0"
+        assert db.scalar(select(Repository.default_branch)) == "main"
+        assert db.scalar(select(func.count()).select_from(Job)) == 1
 
 def test_search_never_crosses_commits():
     with SessionLocal() as db:
@@ -239,7 +252,7 @@ def make_zip(path, content):
 def test_authenticated_end_to_end_contract(monkeypatch):
     sent = []
     monkeypatch.setattr(auth, "send_code", lambda email, code: sent.append(code))
-    monkeypatch.setattr(snapshots, "resolve_repo", lambda _repo: ("o", "r", "main", "d" * 40))
+    monkeypatch.setattr(snapshots, "resolve_repo", lambda _repo: ResolvedRepository("o", "r", "main", "d" * 40, "refs/heads/main"))
     monkeypatch.setattr(jobs, "download_archive", lambda *_args: make_zip("root/app.py", "def answer(): return 42"))
     monkeypatch.setattr(jobs, "make_summary", lambda *_args: {"purpose": "A test project", "components": [], "entrypoints": ["app.py"], "technologies": ["Python"], "uncertainty": "", "suggestedQuestions": []})
     monkeypatch.setattr(jobs, "summarize_repository_nodes", lambda *_args: None)
@@ -260,6 +273,7 @@ def test_authenticated_end_to_end_contract(monkeypatch):
     assert client.get("/api/auth/me", headers=headers).json()["email"] == "user@example.com"
     submitted = client.post("/api/repositories", json={"url": "https://github.com/o/r"}, headers=headers)
     assert submitted.status_code == 200
+    assert submitted.json()["ref"] == "refs/heads/main"
     snapshot_id = submitted.json()["snapshotId"]
     assert client.get(f"/api/snapshots/{snapshot_id}/status", headers=headers).json()["status"] == "queued"
     with SessionLocal() as db:

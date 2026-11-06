@@ -146,9 +146,10 @@ def auth_logout(token: str | None = Depends(bearer), _user: User = Depends(curre
 
 @app.post("/api/repositories")
 def repositories(body: RepoRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    snapshot = submit(db, body.url, user.id)
+    submitted = submit(db, body.url, user.id)
+    snapshot = submitted.snapshot
     kick(db, snapshot.id)
-    return {"snapshotId": snapshot.id, "sha": snapshot.sha, "status": snapshot.status}
+    return {"snapshotId": snapshot.id, "sha": snapshot.sha, "status": snapshot.status, "ref": submitted.ref}
 
 @app.get("/api/snapshots/{snapshot_id}/status")
 def snapshot_status(snapshot_id: str, _user: User = Depends(current_user), db: Session = Depends(get_db)):
