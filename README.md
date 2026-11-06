@@ -4,7 +4,7 @@ An in-page assistant for public GitHub repositories. The Chrome extension is Rea
 
 ## Local setup
 
-1. Start PostgreSQL and create a database named `gitlens`.
+1. Start PostgreSQL with the pgvector extension available and create a database named `gitlens`. For Docker, use `pgvector/pgvector:pg17` rather than the plain PostgreSQL image.
 2. Copy `server/.env.example` to `server/.env`; set `DATABASE_URL` and `SESSION_PEPPER`. Register a GitHub OAuth app with callback `https://copoojjfbgbgcnaokahlbopnafkljfkf.chromiumapp.org/github`, then set `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET` in the server file. Keep the client secret out of the extension. `EMAIL_PROVIDER=console` remains available for backend-only local tests.
 3. In `server/`, run `python -m venv .venv`, activate it, run `pip install -r requirements-dev.txt`, and `alembic upgrade head`.
 4. Start the API with `python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8001` and the worker with `python -m app.worker` in separate terminals.
@@ -12,6 +12,29 @@ An in-page assistant for public GitHub repositories. The Chrome extension is Rea
 6. Visit a public GitHub repository and use **Continue with GitHub**. The OAuth app requests no scopes and GitLens stores its own session token; it does not retain the GitHub access token.
 
 Run backend tests with `python -m pytest` and extension tests with `npm test`. No-card hosted setup is in [`DEPLOY.md`](DEPLOY.md); operating limits are in `docs/operations.md`.
+
+## Database and CI verification
+
+Migration `0004_agentic_rag` requires pgvector (`CREATE EXTENSION vector` privileges).
+`pg_search` is optional: unavailable extension files or insufficient privileges leave
+the native PostgreSQL GIN full-text index in place. Embedding storage and its HNSW
+index still require pgvector. Downgrades retain installed extensions, which may be
+shared by other applications, while removing GitLens tables and indexes.
+
+CI runs backend and frontend as independent jobs. Backend CI starts
+`pgvector/pgvector:pg17` without pg_search, upgrades a fresh database, runs pytest
+(including PostgreSQL fallback regressions), and performs a full downgrade/upgrade.
+For local integration checks, use a disposable test database and set both
+`DATABASE_URL` and `TEST_DATABASE_URL` to its SQLAlchemy PostgreSQL URL before
+running `alembic upgrade head` and `python -m pytest -q` from `server/`.
+The integration tests truncate application data; never point these settings at a
+development or production database containing data you need.
+
+Frontend CI builds, tests, and lints the extension even when the backend job fails.
+Automated adapter tests mock GitHub, Gemini, and email; PostgreSQL integration
+tests use a real database but mock external providers. Live-provider evaluations
+remain separate under `eval/` and are not run by CI. This repair changes no public
+HTTP endpoints or request/response formats.
 
 ## Information-retrieval evaluation
 

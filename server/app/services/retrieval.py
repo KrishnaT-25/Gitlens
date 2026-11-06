@@ -219,7 +219,7 @@ def hybrid_search_scored(db: Session, snapshot_id: str, question: str, limit: in
             selected.append(chunk)
             paths.add(chunk.path)
             if len(selected) >= limit:
-                return selected
+                return [(item, ranks[item.id]) for item in selected]
     for chunk in ordered:
         if chunk.id not in {item.id for item in selected} and not any(
                 item.path == chunk.path and item.line_start <= chunk.line_end and chunk.line_start <= item.line_end

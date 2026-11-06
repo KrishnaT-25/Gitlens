@@ -10,7 +10,7 @@ from app.db import SessionLocal
 from app.models import Chunk, CodeChallenge, Job, Quota, Repository, Snapshot, User, now
 from app.main import app
 from app.services import auth, snapshots, jobs, rag
-from app.services.retrieval import search
+from app.services.retrieval import search, hybrid_search, hybrid_search_scored
 from app.errors import AppError
 
 pytestmark = pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="PostgreSQL integration database not configured")
@@ -97,6 +97,65 @@ def test_search_finds_named_file_with_short_content():
         db.add(Chunk(snapshot_id=snapshot.id, path="README", line_start=1, line_end=1, text="Hello World!"))
         db.commit()
         assert [c.path for c in search(db, snapshot.id, "What does the README say?")] == ["README"]
+
+
+def test_optional_search_extension_unavailable_does_not_abort_migration():
+    """Exercise the actual missing-control-file SQLSTATE in PostgreSQL, without mocks."""
+    import importlib.util
+    from pathlib import Path
+    from sqlalchemy.exc import DBAPIError
+
+    path = Path(__file__).parents[1] / "migrations/versions/0004_agentic_rag.py"
+    spec = importlib.util.spec_from_file_location("agentic_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    missing = "gitlens_missing_optional_search"
+    with SessionLocal() as db:
+        with pytest.raises(DBAPIError) as error:
+            with db.begin_nested():
+                db.execute(text(f"CREATE EXTENSION {missing}"))
+        assert error.value.orig.sqlstate == "0A000"
+        db.execute(text(migration.OPTIONAL_PG_SEARCH_SQL.replace("pg_search", missing)))
+        assert db.scalar(text("SELECT 1")) == 1
+        assert db.scalar(text("SELECT count(*) FROM pg_extension WHERE extname='vector'")) == 1
+        indexes = dict(db.execute(text("""
+            SELECT c.relname, a.amname FROM pg_class c
+            JOIN pg_am a ON a.oid=c.relam
+            WHERE c.relname IN ('ix_chunks_search', 'ix_chunk_embeddings_hnsw')
+        """)).all())
+        assert indexes == {"ix_chunks_search": "gin", "ix_chunk_embeddings_hnsw": "hnsw"}
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3])
+def test_scored_fts_fallback_without_pg_search(limit, monkeypatch):
+    """The full result path must retain scores and isolate snapshot/index versions."""
+    from app.services import retrieval
+
+    def unexpected_embedding(*_args):
+        pytest.fail("FTS-only retrieval must not call the embedding provider")
+
+    monkeypatch.setattr(retrieval, "embed_texts", unexpected_embedding)
+    with SessionLocal() as db:
+        if db.scalar(text("SELECT count(*) FROM pg_extension WHERE extname='pg_search'")):
+            pytest.skip("This regression requires PostgreSQL without pg_search")
+        repo = Repository(owner="o", name="r", canonical_url="https://github.com/o/r", default_branch="main")
+        db.add(repo); db.flush()
+        snapshot = Snapshot(repository_id=repo.id, sha="a" * 40, status="ready", summary={},
+                            index_version=2, index_report={"keywordSearch": "postgres_fts", "semantic": "bm25_only"})
+        other = Snapshot(repository_id=repo.id, sha="b" * 40, status="ready", summary={})
+        db.add_all([snapshot, other]); db.flush()
+        db.add_all([Chunk(snapshot_id=snapshot.id, index_version=2, path=f"src/file{i}.py",
+                          line_start=1, line_end=1, text="migrationneedle") for i in range(3)])
+        db.add_all([
+            Chunk(snapshot_id=snapshot.id, index_version=1, path="stale.py", line_start=1, line_end=1, text="migrationneedle"),
+            Chunk(snapshot_id=other.id, path="other.py", line_start=1, line_end=1, text="migrationneedle"),
+        ])
+        db.commit()
+        ranked = hybrid_search_scored(db, snapshot.id, "migrationneedle", limit)
+        assert len(ranked) == limit
+        assert all(isinstance(score, float) and score > 0 for _, score in ranked)
+        assert all(chunk.path.startswith("src/") and chunk.index_version == 2 for chunk, _ in ranked)
+        assert [chunk.id for chunk in hybrid_search(db, snapshot.id, "migrationneedle", limit)] == [chunk.id for chunk, _ in ranked]
 
 def test_worker_retries_and_rejects_stale_lease(monkeypatch):
     with SessionLocal() as db:

@@ -15,10 +15,21 @@ down_revision = "0003_path_search"
 branch_labels = None
 depends_on = None
 
+# A missing extension control file raises feature_not_supported (0A000) on
+# PostgreSQL 17, rather than undefined_file (58P01). Keep this optional block
+# transactional so the native FTS index remains usable after either failure.
+OPTIONAL_PG_SEARCH_SQL = """
+    DO $$ BEGIN
+      CREATE EXTENSION IF NOT EXISTS pg_search;
+    EXCEPTION WHEN feature_not_supported OR undefined_file OR insufficient_privilege THEN
+      RAISE NOTICE 'pg_search unavailable or not permitted; BM25 will use PostgreSQL FTS fallback';
+    END $$
+"""
+
 
 def upgrade():
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    op.execute("DO $$ BEGIN CREATE EXTENSION IF NOT EXISTS pg_search; EXCEPTION WHEN undefined_file OR insufficient_privilege THEN RAISE NOTICE 'pg_search unavailable or not permitted; BM25 will use PostgreSQL FTS fallback'; END $$")
+    op.execute(OPTIONAL_PG_SEARCH_SQL)
     op.add_column("snapshots", sa.Column("index_version", sa.Integer(), nullable=False, server_default="1"))
     op.add_column("snapshots", sa.Column("index_report", sa.JSON(), nullable=True))
     op.add_column("chunks", sa.Column("index_version", sa.Integer(), nullable=False, server_default="1"))
