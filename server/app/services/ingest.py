@@ -13,7 +13,14 @@ from app.adapters.github import _headers, _check
 
 SKIP_DIRS = {".git", ".svn", ".hg", ".next", ".nuxt", ".angular", ".parcel-cache", ".turbo", ".cache", ".terraform", ".gradle", ".pytest_cache", ".mypy_cache", "build", "dist", "coverage", "htmlcov", "out", "target", "storybook-static", "node_modules", "bower_components", "vendor", "third_party", "venv", ".venv", "__pycache__", "site-packages", "pods", "carthage"}
 SKIP_SUFFIXES = {".bin", ".class", ".dll", ".exe", ".gif", ".ico", ".jar", ".jpeg", ".jpg", ".map", ".min.js", ".pdf", ".png", ".pyc", ".woff", ".woff2", ".zip", ".tar", ".gz", ".7z", ".mp3", ".mp4", ".sqlite", ".db"}
-SECRET_VALUE_RE = re.compile(r"(?i)(\b[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?token|auth(?:orization)?[_-]?(?:token)?|client[_-]?(?:secret|id)|password|passwd|secret(?:[_-]?(?:key|token))?|token|private[_-]?key|credential|database[_-]?url|db[_-]?url|connection[_-]?string|jwt[_-]?secret|signing[_-]?key)[A-Za-z0-9_.-]*\b\s*[:=]\s*)(?:([\"'])([^\"'\r\n]*)\2|([^\r\n,;}]+))")
+SECRET_NAME_RE = re.compile(r"(?:^|[_\W])(?:api[_-]?key|access[_-]?token|auth|authorization|auth[_-]?token|client[_-]?secret|password|passwd|secret|secret[_-]?(?:key|token)|token|private[_-]?key|credential|database[_-]?url|db[_-]?url|connection[_-]?string|jwt[_-]?secret|signing[_-]?key)(?:$|[_\W])", re.I)
+QUOTED_VALUE = r'"""[\s\S]*?"""' + "|'''[\\s\\S]*?'''|" + r'"(?:\\[\s\S]|[^"\\])*"|\'(?:\\[\s\S]|[^\'\\])*\''
+KEY_PATTERN = r"[\"']?[A-Za-z_][A-Za-z0-9_.-]*[\"']?"
+CONFIG_VALUE_RE = re.compile(r"(?P<prefix>(?P<key>" + KEY_PATTERN + r")[ \t]*[:=][ \t]*)(?P<value>" + QUOTED_VALUE + r"|[^\r\n,;{}#]+)")
+LINE_CONFIG_VALUE_RE = re.compile(r"(?m)^(?P<prefix>[ \t]*(?:export[ \t]+)?(?P<key>" + KEY_PATTERN + r")[ \t]*[:=][ \t]*)(?P<value>" + QUOTED_VALUE + r"|[^\r\n]+)")
+SOURCE_LITERAL_RE = re.compile(r"(?P<key>" + KEY_PATTERN + r")(?:[ \t]*:[ \t]*[^=,;\r\n]+)?[ \t]*[:=][ \t]*(?:[rubRUB]{0,2})(?P<value>" + QUOTED_VALUE + ")")
+STRING_BODY_RE = re.compile(r"(?is)^(?:[rub]{0,2})(?P<quote>\"\"\"|'''|[\"'`])(?P<body>.*)(?P=quote)$")
+CONFIG_SUFFIXES = {".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties"}
 AUTH_HEADER_RE = re.compile(r"(?im)(\b(?:authorization|proxy-authorization)\s*:\s*)(?:bearer|basic)\s+[^\s,;]+")
 TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{30,}|AIza[A-Za-z0-9_-]{30,}|sk-[A-Za-z0-9_-]{24,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{20,})\b")
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----", re.DOTALL)
@@ -91,14 +98,136 @@ def _eligible(path: str) -> bool:
     return True
 
 def _redact(content: str, path: str) -> str:
+    """Redact values before indexing, preserving delimiters and every line break."""
     if path.lower().endswith((".pem", ".key", ".p12", ".pfx")):
-        return "\n".join("[REDACTED SENSITIVE MATERIAL]" if line.strip() else "" for line in content.splitlines())
-    content = PRIVATE_KEY_RE.sub(lambda match: "\n".join("[REDACTED PRIVATE KEY]" if line.strip() else "" for line in match.group(0).splitlines()), content)
-    content = re.sub(r"(?m)^.*-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----.*$", "[REDACTED PRIVATE KEY]", content)
-    content = re.sub(r"(?i)(://[^:/\s]+:)[^@/\s]+(@)", r"\1[REDACTED]\2", content)
-    content = AUTH_HEADER_RE.sub(r"\1[REDACTED]", content)
-    content = SECRET_VALUE_RE.sub(lambda match: f"{match.group(1)}{match.group(2) or ''}[REDACTED]{match.group(2) or ''}", content)
+        return _mask_lines(content, "[REDACTED SENSITIVE MATERIAL]")
+    filename = PurePosixPath(path.lower())
+    config = filename.suffix in CONFIG_SUFFIXES or filename.name == ".env" or filename.name.startswith(".env.") or filename.name in {".npmrc", ".pypirc"}
+    content = _redact_config(content, filename.suffix) if config else _redact_source(content, path)
+    content = PRIVATE_KEY_RE.sub(lambda match: _mask_lines(match.group(0), "[REDACTED PRIVATE KEY]"), content)
+    # Incomplete markers must not erase the surrounding assignment or quotes.
+    content = re.sub(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----", "[REDACTED PRIVATE KEY]", content)
+    content = re.sub(r"(?i)(://[A-Za-z0-9_.%+-]+:)[^@/\s\"'`{}<>\\]+(@)", r"\1[REDACTED]\2", content)
+    if config or filename.suffix in {".md", ".rst", ".txt", ".http"}:
+        content = AUTH_HEADER_RE.sub(r"\1[REDACTED]", content)
     return TOKEN_RE.sub("[REDACTED TOKEN]", content)
+
+
+def _mask_lines(value: str, marker: str = "[REDACTED]") -> str:
+    """Preserve CRLF/LF and escaped line continuations inside quoted strings."""
+    def replace(match):
+        continuation = re.search(r"\\+$", match.group(0))
+        followed_by_newline = match.end() < len(value) and value[match.end()] in "\r\n"
+        indent = re.match(r"[ \t]*", match.group(0)).group(0)
+        return indent + marker + (continuation.group(0) if followed_by_newline and continuation else "")
+    return re.sub(r"[^\r\n]+", replace, value)
+
+
+def _secret_name(name: str) -> bool:
+    return bool(SECRET_NAME_RE.search(re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)))
+
+
+def _redact_config(content: str, suffix: str) -> str:
+    """Handle configuration scalars, including unquoted values and YAML blocks."""
+    structured = suffix in {".json", ".jsonc", ".toml", ".yaml", ".yml"}
+    def replace(match):
+        value = match.group("value")
+        if (not _secret_name(match.group("key")) or value.lstrip().startswith(("$", "{{"))
+                or (structured and value.lstrip().startswith("["))):
+            return match.group(0)
+        literal = STRING_BODY_RE.fullmatch(value)
+        if literal:
+            start, end = literal.span("body")
+            return match.group("prefix") + value[:start] + _mask_lines(value[start:end]) + value[end:]
+        comment = re.search(r"[ \t]+[#;]", value) if not structured else None
+        scalar = value[:comment.start()] if comment else value
+        stripped = scalar.rstrip(" \t")
+        if not stripped or re.fullmatch(r"[|>][+-]?\d?", stripped):
+            return match.group(0)
+        marker = '"[REDACTED]"' if structured else "[REDACTED]"
+        return match.group("prefix") + marker + value[len(stripped):]
+
+    content = (CONFIG_VALUE_RE if structured else LINE_CONFIG_VALUE_RE).sub(replace, content)
+    if suffix in {".yaml", ".yml"}:
+        lines = content.splitlines(keepends=True)
+        block_indent = None
+        for index, line in enumerate(lines):
+            indent = len(line) - len(line.lstrip(" \t"))
+            if block_indent is not None and line.strip():
+                if indent > block_indent:
+                    lines[index] = line[:indent] + _mask_lines(line[indent:])
+                    continue
+                block_indent = None
+            block = re.match(r"^[ \t]*(" + KEY_PATTERN + r"):[ \t]*[|>][+-]?\d?[ \t]*(?:#.*)?(?:\r?\n|$)", line)
+            if block and _secret_name(block.group(1)):
+                block_indent = indent
+        content = "".join(lines)
+    return content
+
+
+def _redact_source(content: str, path: str) -> str:
+    """Mask literal bodies bound to sensitive names; never consume code expressions."""
+    language = EXTENSION_LANGUAGE.get(PurePosixPath(path).suffix.lower())
+    try:
+        from tree_sitter_language_pack import get_parser
+        encoded = content.encode("utf-8")
+        tree = get_parser(language).parse(encoded) if language and language not in {"markdown", "rst"} else None
+    except Exception:
+        tree = None
+    if tree is None:
+        # Conservative fallback when no grammar exists: quoted literals only.
+        def replace(match):
+            if not _secret_name(match.group("key")):
+                return match.group(0)
+            value = match.group("value")
+            literal = STRING_BODY_RE.fullmatch(value)
+            if not literal:
+                return match.group(0)
+            start, end = literal.span("body")
+            masked = value[:start] + _mask_lines(value[start:end]) + value[end:]
+            return match.group(0)[:match.start("value") - match.start()] + masked
+        return SOURCE_LITERAL_RE.sub(replace, content)
+
+    spans = {}
+    literals = {"string", "string_literal", "interpreted_string_literal", "raw_string_literal", "template_string", "attribute_value", "AttValue"}
+    skip_values = {"call", "call_expression", "function_call", "function_call_expression", "dictionary", "object", "array", "list", "map_literal"}
+
+    def literal_spans(node):
+        values = [node]
+        while values:
+            current = values.pop()
+            if current.type in skip_values:
+                continue
+            if current.type in literals:
+                # Interpolation is executable syntax, not a credential literal.
+                if any(child.type in {"interpolation", "template_substitution"} for child in current.named_children):
+                    continue
+                raw = encoded[current.start_byte:current.end_byte].decode("utf-8")
+                literal = STRING_BODY_RE.fullmatch(raw)
+                if literal:
+                    start, end = literal.span("body")
+                    begin = current.start_byte + len(raw[:start].encode("utf-8"))
+                    finish = current.start_byte + len(raw[:end].encode("utf-8"))
+                    spans[(begin, finish)] = _mask_lines(raw[start:end]).encode("utf-8")
+                continue
+            values.extend(current.named_children)
+
+    pending = [tree.root_node]
+    while pending:
+        node = pending.pop()
+        key = next((node.child_by_field_name(field) for field in ("name", "left", "key", "pattern", "declarator") if node.child_by_field_name(field)), None)
+        value = node.child_by_field_name("value") or node.child_by_field_name("right")
+        if node.type == "attribute" and len(node.named_children) == 2:
+            key, value = node.named_children
+        if node.type not in {"type_alias_declaration", "type_definition", "type_spec", "type_declaration"} and key and value and _secret_name(encoded[key.start_byte:key.end_byte].decode("utf-8")):
+            literal_spans(value)
+        pending.extend(node.named_children)
+    pieces, cursor = [], 0
+    for (start, end), replacement in sorted(spans.items()):
+        pieces.extend((encoded[cursor:start], replacement))
+        cursor = end
+    pieces.append(encoded[cursor:])
+    return b"".join(pieces).decode("utf-8")
 
 def _line_chunks(path: str, content: str, language: str | None, start_line: int = 1, symbol: str | None = None, kind: str = "text") -> list[IndexedChunk]:
     lines, chunks = content.splitlines(), []

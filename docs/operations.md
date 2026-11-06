@@ -23,6 +23,32 @@ On a public GitHub repository, open GitLens, choose **Continue with GitHub**, au
 - Before migrations, back up PostgreSQL. Check `alembic check` on the current schema. For a release, run `alembic upgrade head` in staging, run the acceptance flow, then deploy production. A rollback should restore the database backup when a migration loses data; `alembic downgrade` is useful for migration rehearsal, not a substitute for backup.
 - Quotas, archive limits, and model selection are in `server/app/config.py`. Start with the defaults and increase only after measuring load. PostgreSQL is the shared source of truth. Render's free deployment has sleep and resource limits; the same API and worker code can move to dedicated services later.
 
+## Ingestion redaction
+
+Redaction runs before chunks, symbols, summaries, or embeddings are built. Source
+files use the available Tree-sitter grammar to identify literal values associated
+with sensitive assignment, parameter, and mapping names. It preserves type
+annotations, type aliases, calls, references, interpolation syntax, quote
+delimiters, operators, and surrounding statements. Without a grammar, a
+conservative fallback masks quoted credential assignments only.
+
+Configuration files (`.env` and its variants, JSON/JSONC, YAML, TOML, INI,
+CFG/CONF, properties, `.npmrc`, and `.pypirc`) have separate scalar handling,
+including unquoted values and YAML blocks. Recognised provider-token formats,
+literal URL passwords, and private keys are removed in either mode. This is
+pattern-based detection, not a guarantee that every possible secret is detected.
+
+Original LF/CRLF separators, terminal newlines, and source line counts are
+preserved. Quoted values retain their delimiters, so citation line numbers still
+refer to the original repository. Redaction changes value contents and may change
+column offsets. There are no public API or database schema changes.
+
+Existing snapshots contain the earlier stored redaction output. They need a
+fresh ingestion to restore damaged code; cached chunks and embeddings cannot
+recover the original text. Retrying a job that resumes existing staged chunks
+does not itself guarantee re-redaction. Do not send old unredacted content to a
+provider when arranging a rebuild.
+
 ## Current limits
 
 Phase 1 supports only public repositories and source files within configured archive/file/text limits. Search is lexical PostgreSQL full-text search, so vocabulary mismatches can produce an evidence gap. No repository code is executed. Gemini's free tier has provider limits and may use submitted data to improve Google products; review current provider terms before inviting users. Render Free sleeps after 15 minutes of inactivity, so the first request can take around a minute; the extension displays a waking status and retries readiness. Render can suspend a free service for excessive outbound traffic or exhausted free hours. Neon has free quotas. A complete hosted smoke run requires those accounts and credentials in their dashboards.
