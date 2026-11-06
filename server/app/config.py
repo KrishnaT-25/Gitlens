@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     gemini_embedding_model: str = "gemini-embedding-2"
     embedding_dimensions: int = 768
     embedding_batch_size: int = 32
+    embedding_response_bytes: int = 4 * 1024 * 1024
+    embedding_request_bytes: int = 1024 * 1024
+    embedding_deadline_seconds: float = 120
     summary_batch_size: int = 20
     max_summary_calls: int = 4
     index_schema_version: int = 2
@@ -64,6 +67,11 @@ class Settings(BaseSettings):
             raise ValueError("RAG retrieval limits are invalid")
         if self.embedding_dimensions != 768 or not 1 <= self.embedding_batch_size <= 100 or self.summary_batch_size < 1 or self.max_summary_calls < 1:
             raise ValueError("Repository index limits are invalid")
+        self.gemini_embedding_model = self.gemini_embedding_model.removeprefix("models/")
+        if self.gemini_embedding_model not in {"gemini-embedding-2", "gemini-embedding-001"}:
+            raise ValueError("Unsupported embedding model; use gemini-embedding-2 or gemini-embedding-001")
+        if not 1024 <= self.embedding_response_bytes <= 16 * 1024 * 1024 or not 1024 <= self.embedding_request_bytes <= 4 * 1024 * 1024 or not 1 <= self.embedding_deadline_seconds <= 300:
+            raise ValueError("Embedding request limits are invalid")
         if not 1 <= self.max_agent_turns <= 4 or not 1 <= self.max_agent_tool_calls <= 6 or self.max_tool_file_lines < 1 or self.max_tool_output_chars < 1000 or self.max_repo_map_chars < 1000:
             raise ValueError("Agent limits are invalid")
         if self.db_connect_attempts < 1 or self.db_connect_backoff_seconds < 0 or self.db_connect_timeout_seconds < 1 or self.worker_shutdown_timeout_seconds < 0:

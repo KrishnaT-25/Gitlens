@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text, select, func
 from sqlalchemy.orm import Session
 from app.config import settings
+from app.adapters.embeddings import semantic_status
 from app.db import get_db
 from app.errors import AppError, app_error_handler
 from app.models import User, Job, Snapshot, now
@@ -154,9 +155,10 @@ def repositories(body: RepoRequest, user: User = Depends(current_user), db: Sess
 @app.get("/api/snapshots/{snapshot_id}/status")
 def snapshot_status(snapshot_id: str, _user: User = Depends(current_user), db: Session = Depends(get_db)):
     s = get_snapshot(db, snapshot_id)
-    if s.status == "queued":
+    if s.status in {"queued", "ready"}:
         kick(db, s.id)
-    return {"snapshotId": s.id, "sha": s.sha, "status": s.status, "errorCode": s.error_code}
+    return {"snapshotId": s.id, "sha": s.sha, "status": s.status, "errorCode": s.error_code,
+            "search": semantic_status(s.index_report)}
 
 @app.post("/api/snapshots/{snapshot_id}/retry")
 def snapshot_retry(snapshot_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):

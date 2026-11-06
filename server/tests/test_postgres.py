@@ -249,6 +249,211 @@ def make_zip(path, content):
         z.writestr(path, content)
     return out.getvalue()
 
+
+def embedding_fixture(db, count=5):
+    """Build a ready text index whose vectors can be repaired without reingestion."""
+    from app.models import SnapshotNode
+    repo = Repository(owner="embedding", name="fixture", canonical_url="https://github.com/embedding/fixture", default_branch="main")
+    db.add(repo); db.flush()
+    snapshot = Snapshot(repository_id=repo.id, sha="a" * 40, status="ready", index_version=2,
+                        summary={"purpose": "cached"}, index_report={"keywordSearch": "postgres_fts", "semantic": "ready"})
+    db.add(snapshot); db.flush()
+    chunks = [Chunk(snapshot_id=snapshot.id, index_version=2, path=f"file{i}.py",
+                    line_start=1, line_end=1, text=f"source {i}") for i in range(count)]
+    db.add_all(chunks)
+    db.add(SnapshotNode(snapshot_id=snapshot.id, index_version=2, path="", parent_path="",
+                        node_type="directory", summary="fixture", metadata_json={}))
+    job = Job(snapshot_id=snapshot.id, status="running", attempts=1, lease_token="owner", lease_until=now() + timedelta(minutes=15))
+    db.add(job); db.commit()
+    return snapshot, chunks, job
+
+
+def test_embedding_rebuild_checkpoints_and_resumes_only_compatible_vectors(monkeypatch):
+    """Real pgvector storage; the provider alone is mocked."""
+    from app.adapters.embeddings import embedding_profile
+    from app.models import ChunkEmbedding
+    monkeypatch.setattr(jobs.settings, "gemini_api_key", "mock-only-key")
+    monkeypatch.setattr(jobs.settings, "embedding_batch_size", 2)
+    profile = embedding_profile()
+    with SessionLocal() as db:
+        snapshot, chunks, job = embedding_fixture(db)
+        for i, chunk in enumerate(chunks):
+            values = {"model": profile["model"], "fingerprint": profile["fingerprint"],
+                      "dimensions": 768, "format_version": profile["formatVersion"]}
+            if i == 0: values["fingerprint"] = None
+            if i == 1: values["model"] = "old-model"
+            if i == 2: values["dimensions"] = 1536
+            if i == 3: values["format_version"] = 0
+            db.add(ChunkEmbedding(chunk_id=chunk.id, values=[1.0] + [0.0] * 767, **values))
+        db.commit()
+        retained = db.scalar(select(ChunkEmbedding.id).where(ChunkEmbedding.chunk_id == chunks[-1].id))
+        calls = []
+        def provider(texts, task, *, titles):
+            calls.append((texts, titles))
+            if len(calls) == 2:
+                raise AppError("embedding_rate_limit", "mock capacity", 503)
+            return [[1.0] + [0.0] * 767 for _ in texts]
+        monkeypatch.setattr(jobs, "embed_texts", provider)
+        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is False
+        assert db.scalar(select(func.count()).select_from(ChunkEmbedding)) == 3
+        assert snapshot.index_report["semanticErrorCode"] == "embedding_rate_limit"
+        assert snapshot.status == "ready"
+        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is True
+        assert calls[-1][0] == ["source 2", "source 3"]
+        assert calls[-1][1] == ["file2.py", "file3.py"]
+        rows = db.scalars(select(ChunkEmbedding)).all()
+        assert len(rows) == 5 and all(row.fingerprint == profile["fingerprint"] for row in rows)
+        assert db.scalar(select(ChunkEmbedding.id).where(ChunkEmbedding.chunk_id == chunks[-1].id)) == retained
+        assert snapshot.index_report["semantic"] == "ready"
+        assert snapshot.index_report["semanticErrorCode"] is None
+
+
+@pytest.mark.parametrize("report_compatible", [False, True])
+def test_incompatible_vectors_cannot_enter_retrieval(monkeypatch, report_compatible):
+    """Exclude different spaces, snapshots and versions even when their distance is smaller."""
+    from app.adapters.embeddings import embedding_profile
+    from app.models import ChunkEmbedding
+    from app.services import retrieval
+    monkeypatch.setattr(jobs.settings, "gemini_api_key", "mock-only-key")
+    profile = embedding_profile()
+    calls = []
+    def query_embedding(*_args):
+        calls.append(True)
+        return [[1.0] + [0.0] * 767]
+    monkeypatch.setattr(retrieval, "embed_texts", query_embedding)
+    with SessionLocal() as db:
+        snapshot, chunks, _job = embedding_fixture(db, 6)
+        other = Snapshot(repository_id=snapshot.repository_id, sha="b" * 40, status="ready", summary={})
+        db.add(other); db.flush()
+        outside = [Chunk(snapshot_id=other.id, path="outside.py", line_start=1, line_end=1, text="other"),
+                   Chunk(snapshot_id=snapshot.id, index_version=1, path="stale.py", line_start=1, line_end=1, text="old")]
+        db.add_all(outside); db.flush()
+        for i, chunk in enumerate(chunks + outside):
+            values = {"model": profile["model"], "fingerprint": profile["fingerprint"],
+                      "dimensions": 768, "format_version": profile["formatVersion"]}
+            if i == 0: values["fingerprint"] = None
+            if i == 1: values["fingerprint"] = "f" * 64
+            if i == 2: values["model"] = "wrong-model"
+            if i == 3: values["dimensions"] = 1536
+            if i == 4: values["format_version"] = 0
+            vector = [0.0, 1.0] + [0.0] * 766 if i == 5 else [1.0] + [0.0] * 767
+            db.add(ChunkEmbedding(chunk_id=chunk.id, values=vector, **values))
+        if report_compatible:
+            snapshot.index_report = {**snapshot.index_report, "embedding": profile}
+        db.commit()
+        ranked = hybrid_search_scored(db, snapshot.id, "unmatchable", 10)
+        assert [chunk.id for chunk, _score in ranked] == ([chunks[5].id] if report_compatible else [])
+        assert len(calls) == int(report_compatible)
+
+
+def test_embedding_worker_rejects_stolen_lease_and_invalid_vectors(monkeypatch):
+    from app.models import ChunkEmbedding
+    monkeypatch.setattr(jobs.settings, "gemini_api_key", "mock-only-key")
+    with SessionLocal() as db:
+        snapshot, _chunks, job = embedding_fixture(db, 1)
+        monkeypatch.setattr(jobs, "embed_texts", lambda *_args, **_kwargs: [[float("nan")] * 768])
+        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is False
+        assert snapshot.index_report["semanticErrorCode"] == "embedding_response"
+        def provider(*_args, **_kwargs):
+            with SessionLocal() as other:
+                other.get(Job, job.id).lease_token = "new-owner"
+                other.commit()
+            return [[1.0] + [0.0] * 767]
+        monkeypatch.setattr(jobs, "embed_texts", provider)
+        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is None
+        assert db.scalar(select(func.count()).select_from(ChunkEmbedding)) == 0
+
+
+def test_embedding_repair_preserves_ready_index_and_cached_summary(monkeypatch):
+    from app.adapters.embeddings import embedding_profile
+    from app.main import snapshot_status
+    monkeypatch.setattr(jobs.settings, "gemini_api_key", "mock-only-key")
+    monkeypatch.setattr(jobs.settings, "worker_mode", "separate")
+    def forbidden(*_args): pytest.fail("Vector repair must reuse text and summary")
+    monkeypatch.setattr(jobs, "download_archive", forbidden)
+    monkeypatch.setattr(jobs, "make_summary", forbidden)
+    monkeypatch.setattr(jobs, "summarize_repository_nodes", forbidden)
+    monkeypatch.setattr(jobs, "embed_texts", lambda texts, *_args, **_kwargs: [[1.0] + [0.0] * 767 for _ in texts])
+    with SessionLocal() as db:
+        snapshot, chunks, job = embedding_fixture(db, 1)
+        job.status = "done"; db.commit()
+        sid, cid, jid = snapshot.id, chunks[0].id, job.id
+        status = snapshot_status(sid, _user=None, db=db)
+        assert status["status"] == "ready" and status["search"]["mode"] == "keyword"
+        assert status["search"]["reason"] == "embedding_incompatible"
+        claimed = jobs.claim(db)
+        assert db.get(Snapshot, sid).status == "ready"
+    jobs.process(*claimed)
+    with SessionLocal() as db:
+        snapshot = db.get(Snapshot, sid)
+        assert snapshot.status == "ready" and snapshot.summary == {"purpose": "cached"}
+        assert db.get(Chunk, cid) is not None and db.get(Job, jid).status == "done"
+        assert snapshot_status(sid, _user=None, db=db)["search"]["mode"] == "hybrid"
+        assert snapshot.index_report["embedding"] == embedding_profile()
+        # A new model schedules one repair; repeated polling preserves the job.
+        monkeypatch.setattr(jobs.settings, "gemini_embedding_model", "gemini-embedding-001")
+        jobs.kick(db, sid)
+        assert db.get(Job, jid).status == "queued" and snapshot.status == "ready"
+        jobs.kick(db, sid)
+        assert db.scalar(select(func.count()).select_from(Job)) == 1
+        assert db.get(Job, jid).attempts == 0
+
+
+def test_missing_embedding_key_exposes_keyword_fallback(monkeypatch):
+    from app.adapters.embeddings import semantic_status
+    monkeypatch.setattr(jobs.settings, "gemini_api_key", "")
+    with SessionLocal() as db:
+        snapshot, _chunks, job = embedding_fixture(db, 1)
+        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is False
+        status = semantic_status(snapshot.index_report)
+        assert status["mode"] == "keyword" and status["reason"] == "embedding_unconfigured"
+
+
+def test_embedding_migration_invalidates_legacy_and_schedules_repairs():
+    """Run upgrade/downgrade on populated legacy tables in a rolled-back schema."""
+    import importlib.util
+    import json
+    from pathlib import Path
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from app.db import engine
+    from app.adapters.embeddings import embedding_profile
+    spec = importlib.util.spec_from_file_location("embedding_migration", Path(__file__).parents[1] / "migrations/versions/0005_embedding_compatibility.py")
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            connection.execute(text("CREATE SCHEMA embedding_migration_test"))
+            connection.execute(text("SET LOCAL search_path TO embedding_migration_test, public"))
+            connection.execute(text("CREATE TABLE chunk_embeddings (id integer PRIMARY KEY)"))
+            connection.execute(text("CREATE TABLE snapshots (id text PRIMARY KEY, status text, index_report json, summary json)"))
+            connection.execute(text("""CREATE TABLE jobs (id text PRIMARY KEY, snapshot_id text UNIQUE, status text,
+                attempts integer, lease_until timestamptz, lease_token text, dispatched_at timestamptz,
+                next_attempt_at timestamptz, error_code text)"""))
+            connection.execute(text("INSERT INTO chunk_embeddings (id) VALUES (1)"))
+            report = json.dumps({"semantic": "ready", "embedding": embedding_profile(),
+                                 "embeddingRepairAttempt": embedding_profile()["fingerprint"], "keywordSearch": "postgres_fts"})
+            connection.execute(text("""INSERT INTO snapshots VALUES
+                ('done', 'ready', CAST(:report AS json), '{"purpose":"keep"}'),
+                ('missing', 'ready', NULL, '{}'), ('running', 'ready', NULL, '{}')"""), {"report": report})
+            connection.execute(text("""INSERT INTO jobs (id,snapshot_id,status,attempts,lease_token) VALUES
+                ('job-done','done','done',3,NULL), ('job-running','running','running',1,'keep')"""))
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+                assert connection.execute(text("SELECT fingerprint,dimensions,format_version FROM chunk_embeddings")).one() == (None, 768, 0)
+                stored = connection.scalar(text("SELECT index_report FROM snapshots WHERE id='done'"))
+                assert stored["semantic"] == "keyword_only" and "embedding" not in stored
+                assert stored["keywordSearch"] == "postgres_fts" and "embeddingRepairAttempt" not in stored
+                assert connection.scalar(text("SELECT summary FROM snapshots WHERE id='done'")) == {"purpose": "keep"}
+                assert dict(connection.execute(text("SELECT snapshot_id,status FROM jobs")).all()) == {"done": "queued", "missing": "queued", "running": "running"}
+                assert connection.scalar(text("SELECT lease_token FROM jobs WHERE snapshot_id='running'")) == "keep"
+                migration.downgrade()
+                migration.upgrade()
+                assert connection.scalar(text("SELECT count(*) FROM jobs")) == 3
+        finally:
+            transaction.rollback()
+
 def test_authenticated_end_to_end_contract(monkeypatch):
     sent = []
     monkeypatch.setattr(auth, "send_code", lambda email, code: sent.append(code))

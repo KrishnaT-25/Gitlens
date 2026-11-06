@@ -161,4 +161,7 @@ class ChunkEmbedding(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     chunk_id: Mapped[str] = mapped_column(ForeignKey("chunks.id", ondelete="CASCADE"), unique=True, index=True)
     model: Mapped[str] = mapped_column(String(100), nullable=False)
+    fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    dimensions: Mapped[int] = mapped_column(Integer, nullable=False, default=768)
+    format_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     values: Mapped[list[float]] = mapped_column("embedding", Vector768(), nullable=False)

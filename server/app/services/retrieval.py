@@ -3,7 +3,7 @@ from sqlalchemy import select, func, literal_column, text
 from sqlalchemy.orm import Session
 from app.models import Chunk, Snapshot, ChunkEmbedding
 from app.config import settings
-from app.adapters.embeddings import embed_texts
+from app.adapters.embeddings import embed_texts, embedding_profile, semantic_status, validate_vectors
 from app.errors import AppError
 
 STOP_WORDS = {"a", "about", "an", "and", "are", "can", "could", "describe", "do", "does", "for", "from", "give", "how", "in", "is", "it", "me", "of", "on", "or", "please", "should", "show", "tell", "the", "this", "to", "use", "used", "what", "where", "which", "who", "why", "with", "would"}
@@ -167,20 +167,31 @@ def hybrid_search_scored(db: Session, snapshot_id: str, question: str, limit: in
         bm25_ids = [chunk.id for chunk in search(db, snapshot_id, question, candidate_limit)]
 
     vector_ids: list[str] = []
-    has_vectors = (snapshot.index_report or {}).get("semantic") == "ready" and bool(
+    profile = embedding_profile()
+    has_vectors = semantic_status(snapshot.index_report)["mode"] == "hybrid" and bool(
         db.execute(select(ChunkEmbedding.chunk_id).join(Chunk, Chunk.id == ChunkEmbedding.chunk_id)
-                   .where(Chunk.snapshot_id == snapshot_id, Chunk.index_version == snapshot.index_version).limit(1)).first())
+                   .where(Chunk.snapshot_id == snapshot_id, Chunk.index_version == snapshot.index_version,
+                          ChunkEmbedding.fingerprint == profile["fingerprint"], ChunkEmbedding.model == profile["model"],
+                          ChunkEmbedding.dimensions == profile["dimensions"],
+                          ChunkEmbedding.format_version == profile["formatVersion"]).limit(1)).first())
     if has_vectors and settings.gemini_api_key:
         try:
-            vector = embed_texts([question], "RETRIEVAL_QUERY")[0]
-            literal = "[" + ",".join(f"{value:.8f}" for value in vector) + "]"
+            vector = validate_vectors(embed_texts([question], "RETRIEVAL_QUERY"), 1)[0]
+            literal = "[" + ",".join(str(value) for value in vector) + "]"
             rows = db.execute(text("""
-                SELECT ce.chunk_id FROM chunk_embeddings ce
-                JOIN chunks c ON c.id = ce.chunk_id
-                WHERE c.snapshot_id = :snapshot_id AND c.index_version = :version
-                ORDER BY ce.embedding <=> CAST(:vector AS vector) LIMIT :limit
+                WITH compatible_embeddings AS MATERIALIZED (
+                    SELECT ce.chunk_id, ce.embedding FROM chunk_embeddings ce
+                    JOIN chunks c ON c.id = ce.chunk_id
+                    WHERE c.snapshot_id = :snapshot_id AND c.index_version = :version
+                      AND ce.fingerprint = :fingerprint AND ce.model = :model
+                      AND ce.dimensions = :dimensions AND ce.format_version = :format_version
+                )
+                SELECT chunk_id FROM compatible_embeddings
+                ORDER BY embedding <=> CAST(:vector AS vector) LIMIT :limit
             """), {"snapshot_id": snapshot_id, "version": snapshot.index_version,
-                  "vector": literal, "limit": candidate_limit}).all()
+                  "vector": literal, "limit": candidate_limit, "fingerprint": profile["fingerprint"],
+                  "model": profile["model"], "dimensions": profile["dimensions"],
+                  "format_version": profile["formatVersion"]}).all()
             vector_ids = [row[0] for row in rows]
         except (AppError, Exception):
             db.rollback()

@@ -5,6 +5,27 @@
 - The widget displays the resolved ref and abbreviated actual SHA; its tooltip contains the complete SHA. The ref is request-specific, not persisted on a shared snapshot: aliases of the same repository/SHA share one snapshot and ingestion job.
 - A snapshot is unique for `(repository_id, sha)` and moves `queued → indexing → summarizing → ready`, or to `failed`/`unsupported`. A failed job may retry up to three times. Ready requires indexed chunks and a completed summary. No progress percentage is returned.
 - `GET /api/auth/github/config` returns the public OAuth client ID and fixed Chrome redirect URI. The extension uses GitHub OAuth 2.0 authorization code with PKCE and validates state. `POST /api/auth/github` accepts `{code,codeVerifier}`, exchanges server-side, reads only GitHub's public user identity, and returns `{token,expiresAt}`. `GET /api/auth/me` and `POST /api/auth/logout` require this GitLens bearer token. Email-code endpoints remain for local test compatibility and are disabled in production.
-- `POST /api/repositories` accepts `{url}` and returns `{snapshotId,sha,status,ref}`. The additive `ref` field is a fully qualified branch/tag (`refs/heads/main`, `refs/tags/v1.0`) or the resolved SHA for commit selection. Existing fields are unchanged. Status/retry responses retain their existing shapes; clients preserve the submission's ref while polling or retrying. `GET /api/snapshots/{id}/status` returns `{snapshotId,sha,status,errorCode}`. `GET /api/snapshots/{id}/summary` returns a summary only when ready. `POST /api/snapshots/{id}/chat` accepts `{question,history}` and returns `{answer,insufficientEvidence,citations,sha}`.
+- `POST /api/repositories` accepts `{url}` and returns `{snapshotId,sha,status,ref}`. The additive `ref` field is a fully qualified branch/tag (`refs/heads/main`, `refs/tags/v1.0`) or the resolved SHA for commit selection. Clients preserve the submission's ref while polling or retrying. `GET /api/snapshots/{id}/status` returns `{snapshotId,sha,status,errorCode,search}`; `search` is additive (see below). Retry responses retain their existing shape. `GET /api/snapshots/{id}/summary` returns a summary only when ready. `POST /api/snapshots/{id}/chat` accepts `{question,history}` and returns `{answer,insufficientEvidence,citations,sha}`.
 - Chat retrieval uses PostgreSQL full-text search scoped to one snapshot, expands a bounded synonym set, diversifies matches across files, and adds nearby chunks from the same file. Defaults are 8 matching chunks, up to 16 context chunks, and 56,000 context characters. Follow-up retrieval may use recent user questions, never prior model answers. Citations are accepted only for chunks sent to the model. This provides bounded relevant context, not an unbounded dump of the entire repository.
 - Errors use `{error:{code,message}}`; the API never includes secrets, raw provider responses, or repository source in error bodies.
+
+The status response's `search` object exposes semantic indexing independently of
+snapshot readiness. A ready snapshot can serve its completed text index and
+summary while embeddings are unavailable or being repaired:
+
+```json
+{"mode":"keyword","semanticStatus":"keyword_only","keywordSearch":"postgres_fts","embeddingFingerprint":"<sha256>","reason":"embedding_rate_limit"}
+```
+
+`mode` is `hybrid` only for a completed, compatible embedding index with a configured
+provider key; otherwise it is `keyword`. `semanticStatus` is `pending`, `ready`,
+`keyword_only`, `incompatible`, or `unavailable`. `reason` is null on success and a
+safe `embedding_*` code on failure/incompatibility. `embeddingFingerprint` is null
+for legacy indexes. `keywordSearch` is `bm25` or `postgres_fts`. This describes
+index capability, not whether a particular query's provider call succeeds: a
+transient query embedding failure still falls back to keyword retrieval.
+
+Submission or status polling schedules a single leased repair when the configured
+embedding space changes. `status` remains `ready` for an existing usable index;
+repair reuses chunk IDs, source line ranges, and cached summaries. Chat shapes,
+authentication, citations, and snapshot identity are unchanged.
