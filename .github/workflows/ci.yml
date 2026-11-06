@@ -28,7 +28,7 @@ jobs:
       - run: alembic upgrade head
         working-directory: server
       - name: Backend tests (real PostgreSQL, mocked external providers)
-        run: pytest -q
+        run: python -m pytest -q
         working-directory: server
       - run: alembic downgrade base && alembic upgrade head
         working-directory: server
