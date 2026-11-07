@@ -135,6 +135,26 @@ def test_complex_route_keeps_initial_inspection_and_medium_thinking(monkeypatch)
     assert seen[0]["require_tool"] is True and seen[0]["thinking_level"] == "medium"
 
 
+def test_explanation_and_follow_up_request_distinct_grounded_detail(monkeypatch):
+    db, snapshot = setup_agent(monkeypatch, [chunk("known", 1, 1, text="Worker claims jobs before indexing.")])
+    calls = []
+
+    def model(instruction, contents, *_args, **_kwargs):
+        calls.append((instruction, contents[0]["parts"][0]["text"]))
+        return final("known")
+
+    monkeypatch.setattr(rag, "generate_tool_turn", model)
+    topic = "Explain the flow of this repository for a beginner in detail"
+    first = rag.answer(db, snapshot, topic, [])
+    rag.answer(db, snapshot, "explain me here", [
+        {"role": "user", "content": topic}, {"role": "assistant", "content": first["answer"]},
+    ])
+    assert "numbered list" in calls[0][0]
+    assert "add useful details" in calls[1][0]
+    assert first["answer"] in calls[1][1]
+    assert all("compatible embeddings" in instruction for instruction, _ in calls)
+
+
 def test_direct_answer_cannot_cite_an_unseen_chunk(monkeypatch):
     db, snapshot = setup_agent(monkeypatch, [chunk("known", 1, 1)])
     monkeypatch.setattr(rag, "generate_tool_turn", lambda *_args, **_kwargs: final("other-snapshot"))
