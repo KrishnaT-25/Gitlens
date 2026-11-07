@@ -683,7 +683,9 @@ def test_authenticated_end_to_end_contract(monkeypatch):
     monkeypatch.setattr(jobs, "download_archive", lambda *_args: make_zip("root/app.py", "def answer(): return 42"))
     monkeypatch.setattr(jobs, "make_summary", lambda *_args: {"purpose": "A test project", "components": [], "entrypoints": ["app.py"], "technologies": ["Python"], "uncertainty": "", "suggestedQuestions": []})
     monkeypatch.setattr(jobs, "summarize_repository_nodes", lambda *_args: None)
-    def fake_tool_turn(_instruction, contents, _tools, **_kwargs):
+    instructions = []
+    def fake_tool_turn(instruction, contents, _tools, **_kwargs):
+        instructions.append(instruction)
         import re
         text = contents[0]["parts"][0]["text"]
         match = re.search(r"CHUNK ([0-9a-f-]+) FILE", text)
@@ -709,5 +711,14 @@ def test_authenticated_end_to_end_contract(monkeypatch):
     reply = client.post(f"/api/snapshots/{snapshot_id}/chat", json={"question": "Where is answer?"}, headers=headers)
     assert reply.status_code == 200
     assert reply.json()["citations"][0]["url"].endswith("app.py#L1-L1")
+    assert "The user selected" not in instructions[-1]
+    reply = client.post(f"/api/snapshots/{snapshot_id}/chat",
+                        json={"question": "Where is answer?", "answerLength": "detailed"}, headers=headers)
+    assert reply.status_code == 200
+    assert reply.json()["citations"][0]["url"].endswith("app.py#L1-L1")
+    assert "The user selected Detailed" in instructions[-1]
+    invalid = client.post(f"/api/snapshots/{snapshot_id}/chat",
+                          json={"question": "Where is answer?", "answerLength": "unsupported"}, headers=headers)
+    assert invalid.status_code == 422
     assert client.post("/api/auth/logout", headers=headers).status_code == 200
     assert client.get("/api/auth/me", headers=headers).status_code == 401

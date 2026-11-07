@@ -25,7 +25,7 @@ from app.services.auth import authenticate, github_sign_in, logout, request_code
 from app.quotas import ip_scope
 from app.services.snapshots import submit, get_snapshot, retry_snapshot
 from app.services.jobs import kick
-from app.services.rag import MAX_ANSWER_CHARS, answer, answerable_suggestions
+from app.services.rag import MAX_ANSWER_CHARS, AnswerLength, answer, answerable_suggestions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -80,6 +80,7 @@ class HistoryTurn(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(max_length=max(MAX_ANSWER_CHARS, settings.max_question_chars))
 class ChatRequest(BaseModel):
+    answerLength: AnswerLength = "default"
     question: str = Field(min_length=1, max_length=settings.max_question_chars)
     history: list[HistoryTurn] = Field(default_factory=list, max_length=settings.max_history_turns)
 
@@ -213,7 +214,8 @@ def _chat_work(snapshot_id: str, body: ChatRequest, token: str | None) -> dict:
             consume(db, f"user:{user.id}", "chats", settings.daily_user_chats)
             consume(db, "global", "chats", settings.daily_global_chats)
             db.commit()
-            result = answer(db, s, body.question.strip(), [h.model_dump() for h in body.history])
+            result = answer(db, s, body.question.strip(), [h.model_dump() for h in body.history],
+                            answer_length=body.answerLength)
             check_deadline()
             return result
     except DBAPIError as exc:

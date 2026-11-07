@@ -2,6 +2,7 @@ import json
 import re
 import logging
 from collections.abc import Callable
+from typing import Literal
 from urllib.parse import quote
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,6 +18,18 @@ from app.services.chat_context import question_kind, prepare_context, compact_ma
 
 logger = logging.getLogger(__name__)
 MAX_ANSWER_CHARS = 6000
+AnswerLength = Literal["default", "short", "detailed"]
+LENGTH_GUIDANCE = {
+    "default": "",
+    "short": (
+        "The user selected Short. Give the direct answer in a few sentences or a compact list. "
+        "Compress any structure requested above and keep essential caveats and citations."
+    ),
+    "detailed": (
+        "The user selected Detailed. Expand on relevant reasoning, stages, examples, and limitations "
+        "where the evidence supports them. Keep the explanation focused and cite the supporting sources."
+    ),
+}
 FOLLOW_UP = re.compile(
     r"^(?:(?:and|please)\s+)?(?:"
     r"(?:what|how)\s+about\b|why(?:\s+is\s+that)?[?.!]*$|"
@@ -100,14 +113,16 @@ def answerable_suggestions(db: Session, snapshot_id: str, suggestions: list[str]
             answerable.append(question)
     return answerable
 
-def answer(db: Session, snapshot: Snapshot, question: str, history: list[dict]) -> dict:
+def answer(db: Session, snapshot: Snapshot, question: str, history: list[dict], *,
+           answer_length: AnswerLength = "default") -> dict:
     with chat_deadline(settings.chat_timeout_seconds):
-        result = _answer(db, snapshot, question, history)
+        result = _answer(db, snapshot, question, history, answer_length)
         check_deadline()
         return result
 
 
-def _answer(db: Session, snapshot: Snapshot, question: str, history: list[dict]) -> dict:
+def _answer(db: Session, snapshot: Snapshot, question: str, history: list[dict],
+            answer_length: AnswerLength) -> dict:
     history = history[-settings.max_history_turns:] if settings.max_history_turns else []
     prior_questions = [turn["content"] for turn in history if turn["role"] == "user" and turn["content"].strip()]
     topic = next((prior for prior in reversed(prior_questions) if not FOLLOW_UP.fullmatch(prior)), "")
@@ -159,6 +174,8 @@ def _answer(db: Session, snapshot: Snapshot, question: str, history: list[dict])
         "Describe optional retrieval modes conditionally. Say when the code uses BM25 or falls back to PostgreSQL full-text search, "
         "and when compatible embeddings enable vector retrieval. Source code alone does not establish which mode a deployment used. "
         "Match the user's language and tolerate typos. " + ANSWER_GUIDANCE[style])
+    if length_guidance := LENGTH_GUIDANCE[answer_length]:
+        instruction += " " + length_guidance
     calls_used = 0
     tool_output_chars = 0
     final_data = None

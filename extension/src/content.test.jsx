@@ -70,9 +70,17 @@ test('shows the resolved ref and full SHA through polling and blocks PR submissi
 
   host.shadowRoot.querySelectorAll('.suggestion')[0].click();
   await vi.waitFor(() => expect(host.shadowRoot.querySelector('.message.assistant')).not.toBeNull());
+  expect(api).toHaveBeenCalledWith('POST', '/api/snapshots/snapshot/chat', {
+    question: 'How does it work?', history: [], answerLength: 'default',
+  });
+  const answerLength = host.shadowRoot.querySelector('.answer-length select');
+  answerLength.value = 'detailed';
+  answerLength.dispatchEvent(new Event('change', { bubbles: true }));
+  await tick();
   host.shadowRoot.querySelectorAll('.suggestion')[1].click();
   await vi.waitFor(() => expect(api).toHaveBeenCalledWith('POST', '/api/snapshots/snapshot/chat', {
     question: 'explain me here',
+    answerLength: 'detailed',
     history: [{ role: 'user', content: 'How does it work?' }, { role: 'assistant', content: longAnswer }],
   }));
 

@@ -136,6 +136,8 @@ def test_complex_route_keeps_initial_inspection_and_medium_thinking(monkeypatch)
 
 
 def test_explanation_and_follow_up_request_distinct_grounded_detail(monkeypatch):
+    from app.main import ChatRequest
+
     db, snapshot = setup_agent(monkeypatch, [chunk("known", 1, 1, text="Worker claims jobs before indexing.")])
     calls = []
 
@@ -145,12 +147,14 @@ def test_explanation_and_follow_up_request_distinct_grounded_detail(monkeypatch)
 
     monkeypatch.setattr(rag, "generate_tool_turn", model)
     topic = "Explain the flow of this repository for a beginner in detail"
-    first = rag.answer(db, snapshot, topic, [])
+    first = rag.answer(db, snapshot, topic, [], answer_length=ChatRequest(question=topic, answerLength="short").answerLength)
     rag.answer(db, snapshot, "explain me here", [
         {"role": "user", "content": topic}, {"role": "assistant", "content": first["answer"]},
-    ])
+    ], answer_length=ChatRequest(question="explain me here", answerLength="detailed").answerLength)
     assert "numbered list" in calls[0][0]
+    assert "Compress any structure" in calls[0][0]
     assert "add useful details" in calls[1][0]
+    assert "The user selected Detailed" in calls[1][0]
     assert first["answer"] in calls[1][1]
     assert all("compatible embeddings" in instruction for instruction, _ in calls)
 

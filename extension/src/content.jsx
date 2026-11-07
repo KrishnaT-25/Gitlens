@@ -5,6 +5,10 @@ import { api, send } from './bridge.js';
 import { AnswerMessage } from './answer.jsx';
 
 const styles = `
+.foot.answer-composer{flex-wrap:wrap}
+.answer-length{flex-basis:100%;display:flex;align-items:center;gap:8px;font-size:12px;color:inherit}
+.answer-length select{font:inherit;color:inherit;background:transparent;border:1px solid #a58d70;border-radius:8px;padding:4px 7px;color-scheme:light dark}
+.answer-length select option{color:CanvasText;background:Canvas}
 :host{all:initial;--paper:#f6f0e4;--paper-deep:#efe5d4;--ink:#272624;--muted:#797267;--line:#e2d4bf;--amber:#d78b42;--amber-dark:#a95d27;--amber-soft:#f3dfc8;--green:#3e9b5a;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
 *{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer}button:disabled{cursor:wait;opacity:.58}button:focus-visible,input:focus-visible{outline:3px solid #dc9b5f;outline-offset:2px}
 .launcher{position:fixed;right:24px;bottom:24px;z-index:2147483647;width:58px;height:58px;border:1px solid #edc89f;border-radius:20px;background:linear-gradient(145deg,#fff8e9,#e7b477);color:#392719;font-weight:800;font-size:17px;letter-spacing:-.06em;box-shadow:0 10px 28px #25170e4d;transition:transform .18s ease,box-shadow .18s ease}.launcher:hover{transform:translateY(-2px);box-shadow:0 14px 32px #25170e5c}
@@ -21,6 +25,7 @@ const styles = `
 `;
 
 function Widget({ repo }) {
+  const [answerLength, setAnswerLength] = useState('default');
   const [open, setOpen] = useState(false), [expanded, setExpanded] = useState(false), [signedIn, setSignedIn] = useState(null), [snapshot, setSnapshot] = useState(null);
   const [summary, setSummary] = useState(null), [messages, setMessages] = useState([]), [question, setQuestion] = useState('');
   const [error, setError] = useState(''), [busy, setBusy] = useState(false), [serverStatus, setServerStatus] = useState('');
@@ -35,7 +40,7 @@ function Widget({ repo }) {
     globalThis.chrome.runtime.onMessage.addListener(onStatus);
     return () => globalThis.chrome.runtime.onMessage.removeListener(onStatus);
   }, []);
-  useEffect(() => { setSnapshot(null); setSummary(null); setMessages([]); setError(''); }, [repo.url]);
+  useEffect(() => { setSnapshot(null); setSummary(null); setMessages([]); setAnswerLength('default'); setError(''); }, [repo.url]);
   useEffect(() => {
     if (!open || repo.unsupportedReason) return;
     let cancelled = false;
@@ -82,7 +87,9 @@ function Widget({ repo }) {
       .map(({ role, content }) => ({ role, content }));
     setMessages(old => [...old, { role: 'user', content: q }]);
     try {
-      const result = await api('POST', `/api/snapshots/${snapshot.snapshotId}/chat`, { question: q, history: previous });
+      const result = await api('POST', `/api/snapshots/${snapshot.snapshotId}/chat`, {
+        question: q, history: previous, answerLength,
+      });
       setMessages(old => [...old, { role: 'assistant', content: result.answer, citations: result.citations }]);
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   }
@@ -116,7 +123,7 @@ function Widget({ repo }) {
     try {
       await send({ type: 'LOGOUT' });
     } catch (e) { setError(e.message); }
-    finally { setSignedIn(false); setSnapshot(null); setSummary(null); setMessages([]); setBusy(false); }
+    finally { setSignedIn(false); setSnapshot(null); setSummary(null); setMessages([]); setAnswerLength('default'); setBusy(false); }
   }
   return <>
     <button className="launcher" aria-label={open ? 'Close GitLens' : 'Open GitLens'} aria-expanded={open} onClick={() => setOpen(!open)}><span aria-hidden="true">GL</span></button>
@@ -139,7 +146,18 @@ function Widget({ repo }) {
         </div>
         {showJump && <button className="jump-latest" type="button" onClick={jumpToLatest}>↓ Jump to latest</button>}
       </div>
-      {snapshot?.status === 'ready' && <form className="foot" onPointerDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()} onSubmit={ask}><textarea ref={textareaRef} rows={1} aria-label="Ask about this repository" value={question} onChange={e => resizeQuestion(e.target.value)} onPointerDown={e => { e.stopPropagation(); e.currentTarget.focus(); }} onClick={e => { e.stopPropagation(); e.currentTarget.focus(); }} onKeyDown={e => { e.stopPropagation(); if (e.key === 'Escape') setOpen(false); else if (e.key === 'Enter' && !e.shiftKey) ask(e); }} placeholder="Ask me about this repository…"/><button aria-label={busy ? 'Sending question' : 'Ask question'} disabled={busy || !question.trim()}>{busy ? '…' : 'Send'}</button></form>}
+      {snapshot?.status === 'ready' && <form className="foot answer-composer" onPointerDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()} onSubmit={ask}>
+        <label className="answer-length">
+          Answer length
+          <select value={answerLength} onChange={e => setAnswerLength(e.target.value)}>
+            <option value="default">Default</option>
+            <option value="short">Short</option>
+            <option value="detailed">Detailed</option>
+          </select>
+        </label>
+        <textarea ref={textareaRef} rows={1} aria-label="Ask about this repository" value={question} onChange={e => resizeQuestion(e.target.value)} onPointerDown={e => { e.stopPropagation(); e.currentTarget.focus(); }} onClick={e => { e.stopPropagation(); e.currentTarget.focus(); }} onKeyDown={e => { e.stopPropagation(); if (e.key === 'Escape') setOpen(false); else if (e.key === 'Enter' && !e.shiftKey) ask(e); }} placeholder="Ask me about this repository…"/>
+        <button aria-label={busy ? 'Sending question' : 'Ask question'} disabled={busy || !question.trim()}>{busy ? '…' : 'Send'}</button>
+      </form>}
     </section>}
   </>;
 }
