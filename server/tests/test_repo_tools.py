@@ -24,5 +24,12 @@ def test_read_file_window_uses_actual_lines_when_file_ends_with_newline():
     assert lines == ["only line"]
     assert (start, end) == (1, 1)
 
+@pytest.mark.parametrize(("start", "end"), [(0, 1), (3, 3), (2, 1)])
+def test_read_file_window_rejects_invalid_ranges(start, end):
+    with pytest.raises(AppError) as exc:
+        repo_tools._line_window("one\ntwo", start, end, 200)
+    assert exc.value.code == "invalid_tool_range"
+
+
 def test_read_file_window_handles_empty_content():
     assert repo_tools._line_window("", 1, 1, 200) == ([], 0, 0)

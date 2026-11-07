@@ -27,3 +27,5 @@ python -m eval.run_response_quality
 ```
 
 The runner rolls back its seeded rows and writes the per-case evidence paths and ranges to `eval/results/response_quality.json`. Use `--repository owner/name` and `--limit N` for a smaller run. For live generation, provide `GEMINI_API_KEY` through the environment and add `--answers`. Grade the saved answers against the pinned source for factual accuracy, coverage of each requested part, and whether every cited line supports the associated claim. For negative controls, check that the response challenges the unsupported premise.
+
+Score factual support separately from citation validity. For each implementation claim, inspect its cited excerpt and mark the claim as supported, contradicted, or unsupported. For example, a citation to the outgoing peer constructor can be a valid link and still leave a claim about the incoming-offer branch unsupported.

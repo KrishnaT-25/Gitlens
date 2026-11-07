@@ -4,6 +4,13 @@ from pydantic import ValidationError
 from app.main import ChatRequest
 from app.services import rag
 from app.services.retrieval import _terms
+from app.services.retrieval import FILE_REFERENCE
+
+
+def test_comparison_filenames_include_sentence_final_path():
+    assert FILE_REFERENCE.findall("Compare src/meetingSocket.js and src/meetingWebRTC.js.") == [
+        "src/meetingSocket.js", "src/meetingWebRTC.js",
+    ]
 
 def test_plain_language_storage_and_data_structure_terms_expand_to_code_terms():
     terms = _terms("What data structures are stored in local storage?")
@@ -15,10 +22,14 @@ def _final(answer, ids=(), insufficient=False):
         "answer": answer, "citedChunkIds": list(ids), "insufficientEvidence": insufficient}}]}
 
 
-def test_follow_up_uses_prior_topic_on_first_search_and_accepts_full_answer(monkeypatch):
+@pytest.mark.parametrize(("question", "detail"), [
+    ("explain me here", ""),
+    ("Go deeper on what happens after admission.", "what happens after admission."),
+])
+def test_follow_up_uses_prior_topic_on_first_search_and_accepts_full_answer(monkeypatch, question, detail):
     topic = "How does the ingestion worker acquire a lease?"
     previous_answer = ("Unverified claim from a previous answer. " + "x" * 6000)[:6000]
-    request = ChatRequest(question="explain me here", history=[
+    request = ChatRequest(question=question, history=[
         {"role": "user", "content": topic}, {"role": "assistant", "content": previous_answer},
     ])
     chunk = SimpleNamespace(id="lease", path="jobs.py", line_start=1, line_end=1, text="def claim(): pass")
@@ -40,7 +51,7 @@ def test_follow_up_uses_prior_topic_on_first_search_and_accepts_full_answer(monk
     db = SimpleNamespace(get=lambda *_: SimpleNamespace(owner="org", name="repo"), commit=lambda: None)
     snapshot = SimpleNamespace(id="snap", repository_id="repo", sha="b" * 40)
     result = rag.answer(db, snapshot, request.question, [turn.model_dump() for turn in request.history])
-    assert queries == [topic]
+    assert queries == [f"{topic}\n{detail}" if detail else topic]
     assert [citation["path"] for citation in result["citations"]] == ["jobs.py"]
 
 
@@ -99,7 +110,7 @@ def test_agent_uses_repo_tool_then_cites_its_evidence(monkeypatch):
         if len(calls) == 1:
             return {"content": {"role": "model", "parts": []}, "calls": [{"name": "read_file", "args": {"path": "server/app.py"}}]}
         return _final("The entry point is run.", [chunk.id])
-    def execute(_db, _snapshot, _name, _args, evidence):
+    def execute(_db, _snapshot, _name, _args, evidence, **_kwargs):
         evidence[chunk.id] = chunk
         return {"path": chunk.path, "evidence": [{"chunkId": chunk.id}]}
     monkeypatch.setattr(rag, "hybrid_search", lambda *_args: [])
@@ -126,7 +137,7 @@ def test_agent_turn_and_tool_call_budgets(monkeypatch):
             "calls": [{"name": "search", "args": {"query": "anything"}}]}
     monkeypatch.setattr(rag, "hybrid_search", lambda *_args: [])
     monkeypatch.setattr(rag, "generate_tool_turn", model)
-    monkeypatch.setattr(rag, "execute_tool", lambda *_args: {"results": []})
+    monkeypatch.setattr(rag, "execute_tool", lambda *_args, **_kwargs: {"results": []})
     monkeypatch.setattr(rag, "_repository_map", lambda *_args: "map")
     class Db:
         def get(self, _model, _id): return SimpleNamespace(owner="org", name="repo")

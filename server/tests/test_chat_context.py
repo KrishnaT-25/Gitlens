@@ -118,13 +118,29 @@ def test_simple_lookup_can_inspect_when_initial_evidence_is_inadequate(monkeypat
         if len(calls) == 1:
             return {"content": {"parts": []}, "calls": [{"name": "read_file", "args": {"path": "config.py"}}]}
         return final("found")
-    def tool(_db, _snapshot, _name, _args, evidence):
+    def tool(_db, _snapshot, _name, _args, evidence, **_kwargs):
         evidence["found"] = chunk("found", 5, 5, path="config.py", text="batch_size = 32")
         return {"text": "batch_size = 32", "chunkId": "found"}
     monkeypatch.setattr(rag, "generate_tool_turn", model)
     monkeypatch.setattr(rag, "execute_tool", tool)
     result = rag.answer(db, snapshot, "What is the batch size?", [])
     assert len(calls) == 2 and result["citations"][0]["path"] == "config.py"
+
+
+def test_detailed_lookup_requests_source_inspection(monkeypatch):
+    db, snapshot = setup_agent(monkeypatch, [chunk("known", 1, 1)])
+    calls = []
+
+    def model(instruction, _contents, _tools, **kwargs):
+        calls.append((instruction, kwargs))
+        return final("known")
+
+    monkeypatch.setattr(rag, "generate_tool_turn", model)
+    result = rag.answer(db, snapshot, "Which function creates the connection?", [], answer_length="detailed")
+    assert calls[0][1]["require_tool"] is True
+    assert calls[0][1]["thinking_level"] == "medium"
+    assert "350–550 words" in calls[0][0]
+    assert result["citations"]
 
 
 def test_complex_route_keeps_initial_inspection_and_medium_thinking(monkeypatch):
@@ -164,6 +180,78 @@ def test_direct_answer_cannot_cite_an_unseen_chunk(monkeypatch):
     monkeypatch.setattr(rag, "generate_tool_turn", lambda *_args, **_kwargs: final("other-snapshot"))
     result = rag.answer(db, snapshot, "What is the default value?", [])
     assert result["insufficientEvidence"] is True and result["citations"] == []
+
+
+def test_inline_citations_require_a_matching_delivered_span(monkeypatch):
+    db, snapshot = setup_agent(monkeypatch, [chunk("known", 5, 6, path="src/app.py", text="start\nstop")])
+    response = final("known")
+    response["calls"][0]["args"]["answer"] = (
+        "Starts at `src/app.py:L5-L5`. Other claims cite `src/app.py:L2-L6`, "
+        "`src/app.py:L6-L5`, `src/other.py:L5` and "
+        "[a link](https://github.com/o/r/blob/wrong/src/app.py#L1)."
+    )
+    monkeypatch.setattr(rag, "generate_tool_turn", lambda *_args, **_kwargs: response)
+    result = rag.answer(db, snapshot, "What does this do?", [])
+    assert "src/app.py:L5-L5" in result["answer"]
+    assert result["answer"].count("unverified source range") == 3
+    assert "blob/wrong" not in result["answer"]
+
+
+@pytest.mark.parametrize("cite_seen", [True, False])
+def test_tool_budget_preserves_delivered_evidence_but_rejects_omitted_ids(monkeypatch, cite_seen):
+    from app.errors import AppError
+    from app.services.repo_tools import Excerpt, _deliver
+
+    db, snapshot = setup_agent(monkeypatch, [])
+    seen = Excerpt("seen", "src/app.py", 5, 5, "return 42")
+    unseen = Excerpt("unseen", "src/app.py", 6, 6, "x" * 2000)
+    monkeypatch.setattr(rag.settings, "max_tool_output_chars", 1000)
+    attempts = []
+
+    def model(_instruction, contents, _tools, **kwargs):
+        attempts.append(kwargs["force_final"])
+        if len(attempts) == 1:
+            return {"content": {"parts": []}, "calls": [{"name": "search", "args": {"query": "return"}}]}
+        delivered = contents[-1]["parts"][0]["functionResponse"]["response"]
+        assert delivered["results"] == [seen.record()]
+        return final("seen" if cite_seen else "unseen")
+
+    def tool(_db, _snapshot, _name, _args, evidence, *, max_chars):
+        return _deliver("results", [(unseen, {}), (seen, {})], evidence, max_chars)
+
+    monkeypatch.setattr(rag, "generate_tool_turn", model)
+    monkeypatch.setattr(rag, "execute_tool", tool)
+    if cite_seen:
+        result = rag.answer(db, snapshot, "Where is the value?", [])
+        assert [citation["lineStart"] for citation in result["citations"]] == [5]
+    else:
+        with pytest.raises(AppError) as exc:
+            rag.answer(db, snapshot, "Where is the value?", [])
+        assert exc.value.code == "chat_tool_budget"
+    assert attempts == [False, True]
+
+
+def test_invalid_answer_is_repaired_without_showing_internal_chunk_id(monkeypatch):
+    chunk_id = "8589b07c-24b5-409f-827e-eb570623aee3"
+    db, snapshot = setup_agent(monkeypatch, [chunk(chunk_id, 1, 1)])
+    attempts = []
+
+    def model(_instruction, contents, _tools, **kwargs):
+        attempts.append(kwargs["force_final"])
+        response = final(chunk_id)
+        args = response["calls"][0]["args"]
+        if len(attempts) == 1:
+            del args["insufficientEvidence"]
+        else:
+            assert contents[-1]["parts"][0]["functionResponse"]["response"]["error"] == "invalid_answer"
+            args["answer"] = f"See the source [{chunk_id}]."
+        return response
+
+    monkeypatch.setattr(rag, "generate_tool_turn", model)
+    result = rag.answer(db, snapshot, "What is the value?", [])
+    assert attempts == [False, True]
+    assert chunk_id not in result["answer"]
+    assert result["citations"]
 
 
 @pytest.mark.parametrize("model,requested,effective", [

@@ -1,8 +1,8 @@
 import re
-from sqlalchemy import bindparam, cast, select, func, literal_column
+from sqlalchemy import bindparam, cast, select, func, literal_column, or_
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
-from app.models import Chunk, Snapshot, ChunkEmbedding, Vector768
+from app.models import Chunk, Snapshot, ChunkEmbedding, SymbolReference, Vector768
 from app.config import settings
 from app.adapters.embeddings import embed_texts, embedding_profile, semantic_status, validate_vectors
 from app.errors import AppError
@@ -20,7 +20,7 @@ SYNONYM_GROUPS = (
 )
 SYNONYMS = {term: tuple(other for other in group if other != term) for group in SYNONYM_GROUPS for term in group}
 
-FILE_REFERENCE = re.compile(r"(?<![\w.-])(?:[\w.-]+[\\/])*[\w.-]+\.[A-Za-z0-9]{1,12}(?![\w.-])")
+FILE_REFERENCE = re.compile(r"(?<![\w.-])(?:[\w.-]+[\\/])*[\w.-]+\.[A-Za-z0-9]{1,12}(?![\w-]|\.[\w.-])")
 PATH_LINE_REFERENCE = re.compile(r"(?<![\w.-])((?:[\w.-]+[\\/])*[\w.-]+\.[A-Za-z0-9]{1,12}):L?(\d+)(?!\d)", re.IGNORECASE)
 LINE_REFERENCE = re.compile(r"\b(?:lines?|L)\s*(\d+)(?:\s*(?:-|to)\s*(?:L|line\s*)?(\d+))?\b", re.IGNORECASE)
 
@@ -39,6 +39,11 @@ PIPELINE_STAGES = (
      "agent | model | gemini | llm | generation | generate"),
 )
 AUXILIARY_PATH = r"(^|/)(docs?|examples?|eval|fixtures?|tests?)(/|$)|(^|/)(test_|smoke_)|\.(spec|test)\.|\.(md|mdx|rst|txt)$"
+BROAD_FLOW = re.compile(r"\b(?:walk\s+(?:me\s+)?through|step[- ]by[- ]step|end[- ]to[- ]end|each\s+(?:stage|step|do)|what\s+happens)\b", re.I)
+FLOW_PARTS = re.compile(r"[.!?;]\s+|,\s*(?:and\s+)?|\s+(?:and|then)\s+", re.I)
+EXPLICIT_SYMBOL = re.compile(r"\x60([A-Za-z_]\w*)\x60|\b([A-Za-z_]\w*)\s*(?=\()|"
+                             r"\b(?:[A-Za-z]*[a-z0-9][A-Z]\w*|[A-Za-z]\w*_\w+)\b", re.ASCII)
+COMMON_PRODUCT_NAMES = {"github", "gitlab", "javascript", "typescript", "postgresql"}
 
 
 def _scope(snapshot: Snapshot, path: str, symbol: str) -> tuple:
@@ -67,7 +72,8 @@ def _explicit_file_chunks(db: Session, scope: tuple, question: str, limit: int) 
         if match:
             start = int(match.group(1))
             line_range = (start, int(match.group(2) or start))
-    for reference in references:
+    matches = []
+    for reference in list(dict.fromkeys(references))[:limit]:
         if "/" in reference:
             predicate = func.lower(Chunk.path) == reference
         else:
@@ -78,8 +84,11 @@ def _explicit_file_chunks(db: Session, scope: tuple, question: str, limit: int) 
             select(Chunk).where(*scope, predicate).order_by(Chunk.line_start, Chunk.path, Chunk.id).limit(limit)
         ).scalars())
         if chunks:
-            return chunks
-    return []
+            matches.append(chunks)
+    # Reserve one slot per named file before adding further excerpts from any file.
+    ordered = (chunks[i] for i in range(limit) for chunks in matches if i < len(chunks))
+    unique = {chunk.id: chunk for chunk in ordered}
+    return list(unique.values())[:limit]
 
 def _direct_terms(question: str) -> list[str]:
     terms = []
@@ -114,16 +123,23 @@ def _tsquery(expression: str):
 
 
 def _fts(db: Session, scope: tuple, expression: str, limit: int, direct: list[str] | None = None, *,
-         stage_signal: str = "") -> list[Chunk]:
+         stage_signal: str = "", prefer_source: bool = False, filename_terms: tuple[str, ...] = ()) -> list[Chunk]:
     if not expression:
         return []
     query = _tsquery(expression)
     vector = func.to_tsvector(literal_column("'simple'"), Chunk.path + literal_column("' '") + Chunk.text)
     ranks = [func.ts_rank_cd(vector, _tsquery(" | ".join(direct))).desc()] if direct else []
+    if prefer_source or stage_signal:
+        ranks.append(Chunk.path.bool_op("~*")(AUXILIARY_PATH).asc())
     if stage_signal:
-        ranks.extend((Chunk.path.bool_op("~*")(AUXILIARY_PATH).asc(),
-                      vector.bool_op("@@")(_tsquery(stage_signal)).desc()))
-    stmt = (select(Chunk).where(*scope, vector.bool_op("@@")(query))
+        ranks.append(vector.bool_op("@@")(_tsquery(stage_signal)).desc())
+    matches = vector.bool_op("@@")(query)
+    if filename_terms:
+        basename = func.lower(func.regexp_replace(Chunk.path, "^.*/", ""))
+        filename_match = or_(*(basename.contains(term, autoescape=True) for term in filename_terms))
+        ranks.append(filename_match.desc())
+        matches = matches | filename_match
+    stmt = (select(Chunk).where(*scope, matches)
             .order_by(*ranks, func.ts_rank_cd(vector, query).desc(), Chunk.path, Chunk.line_start, Chunk.id).limit(limit))
     return list(db.scalars(stmt))
 
@@ -244,6 +260,57 @@ def _pipeline_anchors(db: Session, scope: tuple, question: str, limit: int) -> l
     return anchors
 
 
+def _symbol_anchors(db: Session, snapshot: Snapshot, scope: tuple, question: str, limit: int) -> list[Chunk]:
+    """Find definitions and occurrences even when broad keyword ranking misses them."""
+    question = FILE_REFERENCE.sub(" ", question)
+    names = dict.fromkeys((match[1] or match[2] or match[0]).strip()
+                          for match in EXPLICIT_SYMBOL.finditer(question)
+                          if match[1] or match[2] or match[0].lower() not in COMMON_PRODUCT_NAMES)
+    prefer_source = not re.search(r"\b(?:docs?|documentation|readme)\b", question, re.I)
+    hits = []
+    for name in list(names)[:min(limit, 4)]:
+        check_deadline()
+        references = (select(SymbolReference.chunk_id, func.bool_or(SymbolReference.is_definition).label("definition"))
+                      .where(SymbolReference.snapshot_id == snapshot.id,
+                             SymbolReference.index_version == snapshot.index_version, SymbolReference.name == name)
+                      .group_by(SymbolReference.chunk_id).subquery())
+        stmt = select(Chunk).join(references, references.c.chunk_id == Chunk.id).where(*scope)
+        ordering = [Chunk.path.bool_op("~*")(AUXILIARY_PATH).asc()] if prefer_source else []
+        indexed = list(db.scalars(stmt.order_by(references.c.definition.desc(), *ordering,
+                                                Chunk.path, Chunk.line_start, Chunk.id).limit(2)))
+        # PostgreSQL's text parser can treat code punctuation as part of a token.
+        # Match a literal identifier with word boundaries in the same index scope.
+        occurrence_stmt = (select(Chunk).where(*scope, Chunk.text.bool_op("~*")(rf"\m{name}\M"))
+                           .order_by(*ordering, Chunk.path, Chunk.line_start, Chunk.id).limit(24))
+        occurrences = list(db.scalars(occurrence_stmt))
+        candidates = {chunk.id: chunk for chunk in [*indexed, *occurrences]}
+        by_path = {}
+        for chunk in candidates.values():
+            by_path.setdefault(chunk.path, chunk)
+        ranked = dict.fromkeys([*(chunk.id for chunk in by_path.values()), *candidates])
+        hits.extend(candidates[chunk_id] for chunk_id in list(ranked)[:3])
+    return hits
+
+
+def _flow_anchors(db: Session, scope: tuple, question: str, limit: int) -> list[Chunk]:
+    """Give distinct clauses in a broad question their own bounded keyword search."""
+    if limit < 2 or not BROAD_FLOW.search(question):
+        return []
+    parts = [_direct_terms(part) for part in FLOW_PARTS.split(question)]
+    parts = [terms for terms in parts if terms and terms[0] not in {"cite", "sources"}]
+    if len(parts) < 2:
+        return []
+    hits = []
+    for terms in parts[:min(limit, 4)]:
+        check_deadline()
+        filename_terms = (terms[0],) if len(terms) <= 4 and len(terms[0]) >= 5 else ()
+        candidates = _fts(db, scope, " | ".join(terms), 4, prefer_source=True, filename_terms=filename_terms)
+        if candidates:
+            paths = {hit.path for hit in hits}
+            hits.append(next((chunk for chunk in candidates if chunk.path not in paths), candidates[0]))
+    return hits
+
+
 def hybrid_search_scored(db: Session, snapshot_id: str, question: str, limit: int = 8, *,
                          path: str = "", symbol: str = "") -> list[tuple[Chunk, float]]:
     """Return ranked evidence from the published snapshot version and requested scope."""
@@ -254,17 +321,18 @@ def hybrid_search_scored(db: Session, snapshot_id: str, question: str, limit: in
     scope = _scope(snapshot, path, symbol)
     report = snapshot.index_report or {}
     exact = _explicit_file_chunks(db, scope, question, limit)
-    anchors = [] if path or symbol or LINE_REFERENCE.search(question) or PATH_LINE_REFERENCE.search(question) else (
-        _pipeline_anchors(db, scope, question, limit)
-    )
+    anchors = []
+    if not (path or symbol or LINE_REFERENCE.search(question) or PATH_LINE_REFERENCE.search(question)):
+        anchors = _pipeline_anchors(db, scope, question, limit) or _flow_anchors(db, scope, question, limit)
     if exact and not anchors:
         return [(chunk, 1.0 / rank) for rank, chunk in enumerate(exact, 1)]
 
+    symbols = _symbol_anchors(db, snapshot, scope, question, limit)
     candidate_limit = min(80, max(limit * 6, 24))
     keyword_ids = _keyword_ids(db, scope, question, candidate_limit, report.get("keywordSearch"))
     vector_ids = _vector_ids(db, scope, question, candidate_limit, report)
     all_ids = set(keyword_ids) | set(vector_ids)
-    by_id = {chunk.id: chunk for chunk in [*anchors, *exact]}
+    by_id = {chunk.id: chunk for chunk in [*anchors, *exact, *symbols]}
     if all_ids:
         by_id.update((chunk.id, chunk) for chunk in db.scalars(select(Chunk).where(*scope, Chunk.id.in_(all_ids))))
 
@@ -293,6 +361,8 @@ def hybrid_search_scored(db: Session, snapshot_id: str, question: str, limit: in
     stage_bonus = max(ranks.values(), default=0.0) + 0.001
     for chunk_id in {chunk.id for chunk in anchors}:
         ranks[chunk_id] += stage_bonus
+    for rank, chunk_id in enumerate(dict.fromkeys(chunk.id for chunk in symbols), 1):
+        ranks[chunk_id] += (2 * stage_bonus if rank == 1 else stage_bonus / rank)
     ordered = sorted(by_id.values(), key=lambda c: (-ranks[c.id], c.path, c.line_start, c.id))
     return [(chunk, ranks[chunk.id]) for chunk in _select_evidence(ordered, limit)]
 

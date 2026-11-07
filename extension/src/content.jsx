@@ -5,6 +5,10 @@ import { api, send } from './bridge.js';
 import { AnswerMessage } from './answer.jsx';
 
 const styles = `
+.message.assistant .answer-content{white-space:normal}
+.message.assistant .answer-content pre{white-space:pre}
+.message.assistant .answer-content :not(pre)>code{white-space:pre-wrap}
+.chat-error button{margin-top:8px}
 .foot.answer-composer{flex-wrap:wrap}
 .answer-length{flex-basis:100%;display:flex;align-items:center;gap:8px;font-size:12px;color:inherit}
 .answer-length select{font:inherit;color:inherit;background:transparent;border:1px solid #a58d70;border-radius:8px;padding:4px 7px;color-scheme:light dark}
@@ -26,6 +30,7 @@ const styles = `
 
 function Widget({ repo }) {
   const [answerLength, setAnswerLength] = useState('default');
+  const [failedChat, setFailedChat] = useState(null);
   const [open, setOpen] = useState(false), [expanded, setExpanded] = useState(false), [signedIn, setSignedIn] = useState(null), [snapshot, setSnapshot] = useState(null);
   const [summary, setSummary] = useState(null), [messages, setMessages] = useState([]), [question, setQuestion] = useState('');
   const [error, setError] = useState(''), [busy, setBusy] = useState(false), [serverStatus, setServerStatus] = useState('');
@@ -40,7 +45,7 @@ function Widget({ repo }) {
     globalThis.chrome.runtime.onMessage.addListener(onStatus);
     return () => globalThis.chrome.runtime.onMessage.removeListener(onStatus);
   }, []);
-  useEffect(() => { setSnapshot(null); setSummary(null); setMessages([]); setAnswerLength('default'); setError(''); }, [repo.url]);
+  useEffect(() => { setSnapshot(null); setSummary(null); setMessages([]); setAnswerLength('default'); setFailedChat(null); setError(''); }, [repo.url]);
   useEffect(() => {
     if (!open || repo.unsupportedReason) return;
     let cancelled = false;
@@ -81,17 +86,20 @@ function Widget({ repo }) {
   }, [messages, busy, error, open]);
   async function submitQuestion(value) {
     if (!value.trim() || busy || !snapshot) return;
-    const q = value.trim(); setQuestion(''); setBusy(true); setError('');
+    const q = value.trim(); setQuestion('');
     const lastQuestion = messages.findLastIndex(message => message.role === 'user');
     const previous = lastQuestion < 0 ? [] : messages.slice(lastQuestion, lastQuestion + 2)
       .map(({ role, content }) => ({ role, content }));
     setMessages(old => [...old, { role: 'user', content: q }]);
+    await sendQuestion({ question: q, history: previous, answerLength });
+  }
+  async function sendQuestion(request) {
+    if (busy || !snapshot) return;
+    setBusy(true); setError(''); setFailedChat(null);
     try {
-      const result = await api('POST', `/api/snapshots/${snapshot.snapshotId}/chat`, {
-        question: q, history: previous, answerLength,
-      });
+      const result = await api('POST', `/api/snapshots/${snapshot.snapshotId}/chat`, request);
       setMessages(old => [...old, { role: 'assistant', content: result.answer, citations: result.citations }]);
-    } catch (e) { setError(e.message); } finally { setBusy(false); }
+    } catch (e) { setError(e.message); setFailedChat(request); } finally { setBusy(false); }
   }
   function ask(event) { event.preventDefault(); submitQuestion(question); }
   function resizeQuestion(value) {
@@ -123,7 +131,7 @@ function Widget({ repo }) {
     try {
       await send({ type: 'LOGOUT' });
     } catch (e) { setError(e.message); }
-    finally { setSignedIn(false); setSnapshot(null); setSummary(null); setMessages([]); setAnswerLength('default'); setBusy(false); }
+    finally { setSignedIn(false); setSnapshot(null); setSummary(null); setMessages([]); setAnswerLength('default'); setFailedChat(null); setBusy(false); }
   }
   return <>
     <button className="launcher" aria-label={open ? 'Close GitLens' : 'Open GitLens'} aria-expanded={open} onClick={() => setOpen(!open)}><span aria-hidden="true">GL</span></button>
@@ -141,7 +149,7 @@ function Widget({ repo }) {
         <div className="conversation" role="log" aria-live="polite" aria-label="Conversation">
           {messages.map((m,i) => <div className={`message ${m.role}`} key={i}><strong>{m.role === 'user' ? 'You' : <span className="ai-badge"><span className="ai-spark" aria-hidden="true">✦</span>GitLens AI</span>}</strong>{m.role === 'assistant' ? <AnswerMessage content={m.content} citations={m.citations} repo={repo} sha={snapshot?.sha}/> : <p>{m.content}</p>}</div>)}
           {busy && <div className="message assistant typing" role="status"><span>GitLens is checking repository context</span><span className="typing-dots" aria-hidden="true"><i/><i/><i/></span></div>}
-          {error && <p className="error" role="alert">{error}</p>}
+          {error && <div className="error chat-error"><div role="alert">{error}</div>{failedChat && snapshot?.status === 'ready' && <button className="primary secondary" type="button" disabled={busy} onClick={() => sendQuestion(failedChat)}>Retry answer</button>}</div>}
           <div ref={tailRef} aria-hidden="true"/>
         </div>
         {showJump && <button className="jump-latest" type="button" onClick={jumpToLatest}>↓ Jump to latest</button>}

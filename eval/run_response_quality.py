@@ -67,13 +67,13 @@ def main():
                 if args.answers:
                     db.add_all(SnapshotFile(snapshot_id=snapshot.id, index_version=2, **vars(file)) for file in parsed.files)
                     _persist_map(db, snapshot.id, 2, parsed.files)
-                    for symbol in parsed.symbols:
-                        enclosing = next((chunk for chunk in chunks_by_path.get(symbol.path, ())
-                                          if chunk.line_start <= symbol.line <= chunk.line_end), None)
-                        if enclosing:
-                            db.add(SymbolReference(snapshot_id=snapshot.id, index_version=2, chunk_id=enclosing.id,
-                                                   path=symbol.path, line=symbol.line, name=symbol.name,
-                                                   is_definition=symbol.is_definition))
+                for symbol in parsed.symbols:
+                    enclosing = next((chunk for chunk in chunks_by_path.get(symbol.path, ())
+                                      if chunk.line_start <= symbol.line <= chunk.line_end), None)
+                    if enclosing:
+                        db.add(SymbolReference(snapshot_id=snapshot.id, index_version=2, chunk_id=enclosing.id,
+                                               path=symbol.path, line=symbol.line, name=symbol.name,
+                                               is_definition=symbol.is_definition))
                 db.flush()
                 for case in questions:
                     expected = set(case["expected_paths"])

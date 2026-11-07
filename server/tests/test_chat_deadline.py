@@ -84,7 +84,7 @@ def test_agent_tools_and_turns_share_one_deadline(monkeypatch, clock):
         calls.append("model")
         now[0] += 20
         return {"content": {"parts": []}, "calls": [{"name": "search", "args": {"query": "test"}}]}
-    def tool(*_args):
+    def tool(*_args, **_kwargs):
         calls.append("tool")
         now[0] += 45
         return {"results": []}

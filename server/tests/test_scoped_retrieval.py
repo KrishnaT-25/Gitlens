@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import text
 
 from app.db import SessionLocal
-from app.models import Chunk, ChunkEmbedding, Repository, Snapshot
+from app.models import Chunk, ChunkEmbedding, Repository, Snapshot, SnapshotFile, SymbolReference
 from app.services import retrieval
 from app.services.repo_tools import execute_tool
 
@@ -51,12 +51,76 @@ def test_keyword_scope_survives_candidate_starvation(corpus, scopes):
     assert list(evidence) == [target.id]
 
 
+def test_read_file_exposes_only_requested_lines_as_evidence(corpus):
+    db, snapshot, _, _ = corpus
+    source = "first\nsecond\nthird"
+    db.add(SnapshotFile(snapshot_id=snapshot.id, index_version=2, path="src/a.py",
+                        content=source, line_count=3, byte_size=len(source)))
+    chunk = Chunk(snapshot_id=snapshot.id, index_version=2, path="src/a.py",
+                  line_start=1, line_end=3, text=source)
+    db.add(chunk)
+    db.flush()
+    evidence = {}
+    output = execute_tool(db, snapshot, "read_file", {"path": "src/a.py", "start_line": 2, "end_line": 2}, evidence)
+    excerpt_id = f"{chunk.id}:L2-L2"
+    assert output["evidence"] == [{"chunkId": excerpt_id, "path": "src/a.py", "lineStart": 2,
+                                   "lineEnd": 2, "text": "second"}]
+    assert list(evidence) == [excerpt_id]
+
+
 def test_named_file_fast_path_honors_scope(corpus):
     db, snapshot, _, add = corpus
     add("a/main.py", "outside")
     target = add("z_scope/main.py", "target")
     result = execute_tool(db, snapshot, "search", {"query": "main.py:1", "path": target.path}, {})
     assert [item["chunkId"] for item in result["results"]] == [target.id]
+
+
+def test_named_file_comparison_reserves_evidence_for_both_files(corpus):
+    db, snapshot, _, add = corpus
+    first = add("src/meetingSocket.js", "join")
+    add(first.path, "admit", line=2)
+    second = add("src/meetingWebRTC.js", "offer")
+    hits = retrieval.hybrid_search(db, snapshot.id,
+        "Compare src/meetingSocket.js and src/meetingWebRTC.js.", 2)
+    assert [chunk.id for chunk in hits] == [first.id, second.id]
+
+
+def test_exact_symbol_definition_beats_broad_matches_and_stays_in_scope(corpus):
+    db, snapshot, other, add = corpus
+    target = add("src/peers.js", "class PeerSession {}")
+    outside = add("outside/peers.js", "class PeerSession {}", owner=other)
+    for source in (target, outside):
+        db.add(SymbolReference(snapshot_id=source.snapshot_id, index_version=2, chunk_id=source.id,
+                               path=source.path, line=1, name="PeerSession", is_definition=True))
+    for i in range(30):
+        add(f"docs/{i}.md", "connection create setup " * 8)
+    db.flush()
+    hits = retrieval.hybrid_search(db, snapshot.id, "How does PeerSession create a connection?", 1)
+    assert [hit.id for hit in hits] == [target.id]
+
+
+def test_broad_flow_retrieves_evidence_for_each_clause(corpus):
+    db, snapshot, _, add = corpus
+    target = [
+        add("join.js", "browser"),
+        add("socket.js", "signaling"),
+        add("peer.js", "webrtc"),
+    ]
+    for i in range(10):
+        add(f"noise/{i}.md", "browser browser browser browser")
+    hits = retrieval.hybrid_search(db, snapshot.id,
+        "Walk me through what happens in the browser, signaling, and WebRTC.", 3)
+    assert {chunk.path for chunk in hits} == {chunk.path for chunk in target}
+
+
+def test_native_symbol_occurrences_cover_more_than_one_file(corpus):
+    db, snapshot, _, add = corpus
+    for line in range(1, 7):
+        add("files.js", "new RTCPeerConnection({});", line=line)
+    add("meetings.js", "new RTCPeerConnection({});")
+    hits = retrieval.hybrid_search(db, snapshot.id, "Which code creates an RTCPeerConnection?", 2)
+    assert {hit.path for hit in hits} == {"files.js", "meetings.js"}
 
 
 def test_bm25_scope_or_fts_fallback_keeps_caller_transaction(corpus, monkeypatch):

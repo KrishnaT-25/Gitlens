@@ -10,6 +10,7 @@
 - The chat request accepts an optional `answerLength` field with values `default`, `short`, or `detailed`. It defaults to `default` when omitted. All modes use the same evidence and citation requirements.
 - Chat history accepts `user` and `assistant` roles. Defaults allow two messages and 8,000 total content characters. User history has the same limit as a new question (2,000 by default), and assistant history has the same 6,000-character limit as an answer.
 - Errors use `{error:{code,message}}`; the API never includes secrets, raw provider responses, or repository source in error bodies.
+- Chat citations are scoped to the source excerpts actually delivered to the model. A bounded file read can cite only the lines it returned, and tool entries omitted for size are ineligible. Inline source ranges must fit a verified cited excerpt. If the inspection budget prevents a grounded answer, the API returns `chat_tool_budget` (503). If the model has enough evidence when it reaches the limit, chat can still return a cited answer.
 
 The status response's `search` object exposes semantic indexing independently of
 snapshot readiness. A ready snapshot can serve its completed text index and

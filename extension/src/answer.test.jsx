@@ -23,9 +23,9 @@ afterEach(async () => {
   container = null;
 });
 
-test('renders markdown as formatted lists and links every referenced file', async () => {
+test('renders lists and links only references with verified citations', async () => {
   const view = await renderAnswer({
-    content: 'PostgreSQL code lives in `server/app/` and `server/migrations/`.\n\n- **`server/app/models.py`**: SQLAlchemy models\n- `server/app/db.py:L1-L10`: engine and session setup',
+    content: 'Node.js and `Socket.IO` use code in `server/app/` and `server/migrations/`.\n\n- **`server/app/models.py`**: SQLAlchemy models\n- `server/app/db.py:L1-L10`: engine and session setup',
     citations: [
       { path: 'server/app/models.py', lineStart: 1, lineEnd: 20, url: 'https://github.com/o/r/blob/abc/server/app/models.py#L1-L20' },
       { path: 'server/app/db.py', lineStart: 1, lineEnd: 10, url: 'https://github.com/o/r/blob/abc/server/app/db.py#L1-L10' },
@@ -33,10 +33,24 @@ test('renders markdown as formatted lists and links every referenced file', asyn
     repo: { owner: 'o', name: 'r' }, sha: 'abc',
   });
   expect(view.querySelectorAll('.answer-content > ul li')).toHaveLength(2);
-  expect(view.querySelectorAll('.answer-content > p .file-chip, .answer-content > ul .file-chip')).toHaveLength(4);
+  expect(view.querySelectorAll('.answer-content > p .file-chip, .answer-content > ul .file-chip')).toHaveLength(2);
+  expect(view.querySelector('.answer-content > p code').textContent).toBe('Socket.IO');
   expect(view.querySelector('.file-chip[href*="models.py"]')?.getAttribute('href')).toContain('https://github.com/o/r/blob/abc/server/app/models.py');
   expect(view.querySelector('strong')).not.toBeNull();
   expect(view.querySelector('.answer-content').textContent).not.toContain('**');
+});
+
+test('uses the matching excerpt when a file has multiple citations', async () => {
+  const path = 'src/meeting.js';
+  const view = await renderAnswer({
+    content: 'See `src/meeting.js` for both branches and `src/meeting.js:L30-L32` for the incoming offer.',
+    citations: [[10, 20], [30, 40]].map(([lineStart, lineEnd]) => ({
+      path, lineStart, lineEnd, url: `https://github.com/o/r/blob/abc/${path}#L${lineStart}-L${lineEnd}`,
+    })),
+  });
+  const links = view.querySelectorAll('.answer-content > p .file-chip');
+  expect(links).toHaveLength(1);
+  expect(links[0].getAttribute('href')).toContain('#L30-L40');
 });
 
 test('keeps raw HTML inert and rejects javascript links', async () => {

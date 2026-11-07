@@ -522,7 +522,7 @@ def test_chat_uses_published_index_during_schema_rebuild(monkeypatch):
         reader.commit()
         jobs.process(jid, "owner")
         source = execute_tool(reader, previous, "read_file", {"path": "file0.py"}, {})
-        assert source["text"] == "1: source 0"
+        assert source["evidence"][0]["text"] == "source 0"
     with SessionLocal() as db:
         visible = db.get(Snapshot, sid)
         assert (visible.status, visible.index_version, visible.summary) == ("ready", 3, {"purpose": "replacement"})

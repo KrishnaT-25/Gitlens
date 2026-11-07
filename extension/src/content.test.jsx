@@ -51,11 +51,18 @@ test('shows the resolved ref and full SHA through polling and blocks PR submissi
   send.mockResolvedValue({ signedIn: true });
   const sha = 'a'.repeat(40);
   const longAnswer = 'x'.repeat(6000);
-  api.mockImplementation(async (method, path) => {
+  let failedFollowUp = false;
+  api.mockImplementation(async (method, path, request) => {
     if (method === 'POST' && path === '/api/repositories') return { snapshotId: 'snapshot', sha, status: 'queued', ref: 'refs/heads/feature/search' };
     if (path.endsWith('/status')) return { snapshotId: 'snapshot', sha, status: 'ready' };
     if (path.endsWith('/summary')) return { summary: { purpose: 'Selected branch', suggestedQuestions: ['How does it work?', 'explain me here'] } };
-    if (path.endsWith('/chat')) return { answer: longAnswer, citations: [] };
+    if (path.endsWith('/chat')) {
+      if (request.question === 'explain me here' && !failedFollowUp) {
+        failedFollowUp = true;
+        throw new Error('Invalid answer');
+      }
+      return { answer: longAnswer, citations: [] };
+    }
     throw new Error(`Unexpected call ${path}`);
   });
   history.pushState({}, '', '/owner/repo/tree/feature/search');
@@ -78,11 +85,19 @@ test('shows the resolved ref and full SHA through polling and blocks PR submissi
   answerLength.dispatchEvent(new Event('change', { bubbles: true }));
   await tick();
   host.shadowRoot.querySelectorAll('.suggestion')[1].click();
-  await vi.waitFor(() => expect(api).toHaveBeenCalledWith('POST', '/api/snapshots/snapshot/chat', {
+  const followUp = {
     question: 'explain me here',
     answerLength: 'detailed',
     history: [{ role: 'user', content: 'How does it work?' }, { role: 'assistant', content: longAnswer }],
-  }));
+  };
+  await vi.waitFor(() => expect(host.shadowRoot.querySelector('.chat-error button')).not.toBeNull());
+  host.shadowRoot.querySelector('.chat-error button').click();
+  await vi.waitFor(() => expect(host.shadowRoot.querySelectorAll('.message.assistant')).toHaveLength(2));
+  expect(host.shadowRoot.querySelectorAll('.message.user')).toHaveLength(2);
+  expect(api.mock.calls.filter(([, path]) => path.endsWith('/chat')).slice(-2)).toEqual([
+    ['POST', '/api/snapshots/snapshot/chat', followUp],
+    ['POST', '/api/snapshots/snapshot/chat', followUp],
+  ]);
 
   vi.clearAllMocks();
   history.pushState({}, '', '/owner/repo/pull/12');

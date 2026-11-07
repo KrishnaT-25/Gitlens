@@ -1,7 +1,7 @@
 import { Children, cloneElement, isValidElement, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { deduplicateSources, githubFileUrl, parseFileReferences } from './references.js';
+import { deduplicateSources, parseFileReferences } from './references.js';
 
 function plainText(node) {
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -51,20 +51,25 @@ function safeMarkdownUrl(value) {
   }
 }
 
-export function AnswerMessage({ content, citations = [], repo, sha }) {
+export function AnswerMessage({ content, citations = [], sha }) {
   const [feedback, setFeedback] = useState('');
   const sources = deduplicateSources(citations);
 
+  function citedSource(reference) {
+    const matches = sources.filter(source => source.path === reference.path);
+    if (!reference.lineStart) return matches.length === 1 ? matches[0] : undefined;
+    return matches.find(source => source.lineStart <= reference.lineStart &&
+      source.lineEnd >= (reference.lineEnd ?? reference.lineStart));
+  }
+
   function fileChip(reference) {
-    const cited = sources.find(source => source.path === reference.path &&
-      (!reference.lineStart || !source.lineStart || (source.lineStart <= reference.lineStart && source.lineEnd >= reference.lineEnd)));
-    const href = cited?.url || githubFileUrl(reference, repo, sha);
+    const href = citedSource(reference)?.url;
     if (!href) return reference.text;
     return <a className="file-chip" href={href} target="_blank" rel="noopener noreferrer" title={`Open ${reference.text}`} aria-label={`Open ${reference.text} on GitHub`}><span aria-hidden="true">▤</span>{reference.text}</a>;
   }
 
   function renderReferences(text) {
-    const references = parseFileReferences(text);
+    const references = parseFileReferences(text).filter(reference => citedSource(reference)?.url);
     if (!references.length) return text;
     const output = [];
     let offset = 0;
@@ -93,7 +98,7 @@ export function AnswerMessage({ content, citations = [], repo, sha }) {
   function InlineCode({ className, children, ...props }) {
     const text = plainText(children).replace(/\n$/, '');
     const refs = parseFileReferences(text);
-    if (!className && refs.length === 1 && refs[0].start === 0 && refs[0].end === text.length) return fileChip(refs[0]);
+    if (!className && refs.length === 1 && refs[0].start === 0 && refs[0].end === text.length && citedSource(refs[0])?.url) return fileChip(refs[0]);
     return <code className={className} {...props}>{children}</code>;
   }
 
