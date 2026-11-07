@@ -1,6 +1,9 @@
 import os
 import io
 import zipfile
+from threading import Event
+from time import monotonic, sleep
+from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 import pytest
@@ -378,12 +381,14 @@ def test_embedding_rebuild_checkpoints_and_resumes_only_compatible_vectors(monke
 def test_incompatible_vectors_cannot_enter_retrieval(monkeypatch, report_compatible):
     """Exclude different spaces, snapshots and versions even when their distance is smaller."""
     from app.adapters.embeddings import embedding_profile
+    from app.deadlines import chat_deadline
     from app.models import ChunkEmbedding
     from app.services import retrieval
     monkeypatch.setattr(jobs.settings, "gemini_api_key", "mock-only-key")
     profile = embedding_profile()
     calls = []
     def query_embedding(*_args):
+        assert not db.in_transaction()
         calls.append(True)
         return [[1.0] + [0.0] * 767]
     monkeypatch.setattr(retrieval, "embed_texts", query_embedding)
@@ -407,7 +412,8 @@ def test_incompatible_vectors_cannot_enter_retrieval(monkeypatch, report_compati
         if report_compatible:
             snapshot.index_report = {**snapshot.index_report, "embedding": profile}
         db.commit()
-        ranked = hybrid_search_scored(db, snapshot.id, "unmatchable", 10)
+        with chat_deadline(10):
+            ranked = hybrid_search_scored(db, snapshot.id, "unmatchable", 10)
         assert [chunk.id for chunk, _score in ranked] == ([chunks[5].id] if report_compatible else [])
         assert len(calls) == int(report_compatible)
 
@@ -676,6 +682,62 @@ def test_embedding_migration_invalidates_legacy_and_schedules_repairs():
         finally:
             transaction.rollback()
 
+@pytest.mark.parametrize("expire", [False, True])
+def test_keyed_chat_replays_one_slow_generation_and_one_quota_charge(monkeypatch, expire):
+    from app.config import settings
+    from app.services import chat_requests
+
+    entered, release = Event(), Event()
+    calls = []
+    monkeypatch.setattr(settings, "chat_timeout_seconds", 1 if expire else 10)
+    def slow_answer(db, snapshot, question, history, **_kwargs):
+        db.commit()
+        calls.append(question)
+        entered.set()
+        assert release.wait(8)
+        return {"answer": "One answer", "sha": snapshot.sha}
+    monkeypatch.setattr(chat_requests, "answer", slow_answer)
+    with SessionLocal() as db:
+        repo = Repository(owner="o", name="r", canonical_url="https://github.com/o/r", default_branch="main")
+        user = User(email="eval@example.com")
+        db.add_all([repo, user])
+        db.flush()
+        snapshot = Snapshot(repository_id=repo.id, sha="e" * 40, status="ready", summary={})
+        db.add(snapshot)
+        db.flush()
+        path = f"/api/snapshots/{snapshot.id}/chat"
+        token, _ = auth.issue_session(db, user.id)
+        db.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {"question": "What does this do?", "requestId": str(uuid4())}
+    with TestClient(app) as client:
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                responses = list(pool.map(lambda _: client.post(path, json=body, headers=headers), range(2)))
+            assert [response.status_code for response in responses] == [202, 202]
+            assert entered.wait(3)
+            assert client.post(path, json={**body, "question": "Changed"}, headers=headers).status_code == 409
+            if not expire:
+                release.set()
+            cutoff = monotonic() + 4
+            while monotonic() < cutoff:
+                response = client.post(path, json=body, headers=headers)
+                if response.status_code != 202:
+                    break
+                sleep(0.05)
+            assert response.status_code == (504 if expire else 200)
+            assert client.post(path, json=body, headers=headers).json() == response.json()
+            if expire:
+                assert response.json()["error"]["code"] == "chat_timeout"
+            else:
+                assert response.json()["answer"] == "One answer"
+        finally:
+            release.set()
+    assert calls == [body["question"]]
+    with SessionLocal() as db:
+        assert sorted(db.scalars(select(Quota.count).where(Quota.action == "chats"))) == [1, 1]
+
+
 def test_authenticated_end_to_end_contract(monkeypatch):
     sent = []
     monkeypatch.setattr(auth, "send_code", lambda email, code: sent.append(code))
@@ -685,6 +747,8 @@ def test_authenticated_end_to_end_contract(monkeypatch):
     monkeypatch.setattr(jobs, "summarize_repository_nodes", lambda *_args: None)
     instructions = []
     def fake_tool_turn(instruction, contents, _tools, **_kwargs):
+        from app.db import engine
+        assert engine.pool.checkedout() == 0
         instructions.append(instruction)
         import re
         text = contents[0]["parts"][0]["text"]

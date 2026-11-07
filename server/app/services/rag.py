@@ -155,7 +155,6 @@ def _answer(db: Session, snapshot: Snapshot, question: str, history: list[dict],
     included = prepared.chunks
     evidence = {chunk.id: Excerpt(chunk.id, chunk.path, chunk.line_start, chunk.line_end, chunk.text)
                 for chunk in included}
-    db.commit()
     repo_map = _repository_map(db, snapshot, [chunk.path for chunk in included])
     kind = question_kind(question, bool(history))
     if follow_up:
@@ -197,6 +196,8 @@ def _answer(db: Session, snapshot: Snapshot, question: str, history: list[dict],
     budget_exhausted = False
     for turn in range(settings.max_agent_turns):
         check_deadline()
+        # Tool reads from the previous turn are complete before model I/O begins.
+        db.commit()
         force_final = repair_final or budget_exhausted or turn == settings.max_agent_turns - 1 or calls_used >= settings.max_agent_tool_calls - 1
         result = generate_tool_turn(instruction, contents, TOOL_DECLARATIONS,
                                     force_final=force_final,

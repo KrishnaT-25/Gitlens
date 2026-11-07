@@ -25,16 +25,23 @@ async function wakeApi(sender) {
   catch (error) { notify('unavailable'); throw error; }
 }
 
-async function api(method, path, body, sender) {
+async function api(method, path, body, sender, timeoutMs) {
   if (!['GET', 'POST'].includes(method) || !/^\/api\/(auth|repositories|snapshots)(\/|$)/.test(path)) throw new Error('Invalid API request.');
-  await wakeApi(sender);
-  const { token } = await chrome.storage.local.get('token');
   // Server chat processing is capped at 60s; allow time for the error/answer
   // to travel back. Cold-start readiness above has its own separate timeout.
   const chat = method === 'POST' && /^\/api\/snapshots\/[^/]+\/chat$/.test(path);
-  const signal = AbortSignal.timeout(chat ? 70_000 : 28_000);
+  const keyed = chat && typeof body?.requestId === 'string';
+  if (!keyed) await wakeApi(sender);
+  const { token } = await chrome.storage.local.get('token');
+  const budget = Number.isFinite(timeoutMs) ? Math.max(1, Math.floor(timeoutMs)) : 25_000;
+  const signal = AbortSignal.timeout(keyed ? Math.min(25_000, budget) : chat ? 70_000 : 28_000);
   try { return await requestApi(method, path, body, token, signal); }
   catch (error) {
+    if (keyed && (signal.aborted || error instanceof TypeError)) {
+      const transport = new Error('The server has not responded yet.');
+      transport.code = 'chat_transport';
+      throw transport;
+    }
     if (signal.aborted) throw new Error(chat ? 'The chat request timed out. Please try a more focused question.' : 'The request timed out. Please try again.');
     throw error;
   }
@@ -62,13 +69,19 @@ async function requestApi(method, path, body, token, signal) {
   for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }
   let result = {};
   try { result = JSON.parse(new TextDecoder().decode(data)); } catch { /* Empty or malformed response. */ }
-  if (!response.ok) { const error = new Error(result.error?.message || `Request failed (${response.status}).`); error.status = response.status; throw error; }
+  if (!response.ok) {
+    const error = new Error(result.error?.message || `Request failed (${response.status}).`);
+    error.status = response.status;
+    error.code = result.error?.code;
+    error.terminal = result.error?.terminal;
+    throw error;
+  }
   return result;
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, reply) => {
   (async () => {
-    if (message.type === 'API') return api(message.method, message.path, message.body, _sender);
+    if (message.type === 'API') return api(message.method, message.path, message.body, _sender, message.timeoutMs);
     if (message.type === 'AUTH_GITHUB') {
       const config = await api('GET', '/api/auth/github/config', undefined, _sender);
       if (config.redirectUri !== chrome.identity.getRedirectURL('github')) throw new Error('GitHub callback URL does not match this extension.');
@@ -89,6 +102,8 @@ chrome.runtime.onMessage.addListener((message, _sender, reply) => {
     if (message.type === 'OPEN_AUTH') { await chrome.tabs.create({ url: chrome.runtime.getURL('auth.html') }); return { opened: true }; }
     if (message.type === 'LOGOUT') { try { await api('POST', '/api/auth/logout'); } finally { await chrome.storage.local.remove('token'); } return { signedIn: false }; }
     throw new Error('Unknown message.');
-  })().then(data => reply({ ok: true, data })).catch(error => reply({ ok: false, error: { message: error.message } }));
+  })().then(data => reply({ ok: true, data })).catch(error => reply({
+    ok: false, error: { message: error.message, code: error.code, terminal: error.terminal },
+  }));
   return true;
 });

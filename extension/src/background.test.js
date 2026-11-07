@@ -19,7 +19,7 @@ beforeEach(async () => {
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-const call = (method, path) => new Promise(resolve => listener({ type: 'API', method, path }, {}, resolve));
+const call = (method, path, body, timeoutMs) => new Promise(resolve => listener({ type: 'API', method, path, body, timeoutMs }, {}, resolve));
 
 test('chat waits 70 seconds while readiness and other calls retain their own timeouts', async () => {
   expect(await call('POST', '/api/snapshots/snapshot/chat')).toEqual({ ok: true, data: { answer: 'ok' } });
@@ -50,5 +50,11 @@ test('client timeout also covers reading the response body', async () => {
     } }) } };
   });
   const result = await call('POST', '/api/snapshots/snapshot/chat');
-  expect(result).toEqual({ ok: false, error: { message: 'The chat request timed out. Please try a more focused question.' } });
+  expect(result).toMatchObject({ ok: false, error: { message: 'The chat request timed out. Please try a more focused question.' } });
+});
+
+test('keyed chat polling fits the remaining client budget without a separate readiness loop', async () => {
+  await call('POST', '/api/snapshots/snapshot/chat', { requestId: 'same-id' }, 7000);
+  expect(timeout).toHaveBeenCalledExactlyOnceWith(7000);
+  expect(fetch).toHaveBeenCalledTimes(1);
 });

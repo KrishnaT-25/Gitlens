@@ -6,7 +6,7 @@ from app.models import Chunk, Snapshot, ChunkEmbedding, SymbolReference, Vector7
 from app.config import settings
 from app.adapters.embeddings import embed_texts, embedding_profile, semantic_status, validate_vectors
 from app.errors import AppError
-from app.deadlines import check_deadline
+from app.deadlines import check_deadline, remaining_seconds
 
 STOP_WORDS = {"a", "about", "an", "and", "are", "can", "could", "describe", "do", "does", "for", "from", "give", "how", "in", "is", "it", "me", "of", "on", "or", "please", "should", "show", "tell", "the", "this", "to", "use", "used", "what", "where", "which", "who", "why", "with", "would"}
 SYNONYM_GROUPS = (
@@ -231,6 +231,9 @@ def _vector_ids(db: Session, scope: tuple, question: str, limit: int, report: di
     if not db.scalar(compatible.with_only_columns(ChunkEmbedding.chunk_id).limit(1)):
         return []
 
+    if remaining_seconds() is not None:
+        # The chat session only reads indexed data. Release its connection during embedding I/O.
+        db.commit()
     try:
         vector = validate_vectors(embed_texts([question], "RETRIEVAL_QUERY"), 1)[0]
         candidates = compatible.cte("compatible_embeddings").prefix_with("MATERIALIZED", dialect="postgresql")

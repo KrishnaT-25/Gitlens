@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import hmac
 import json
@@ -25,12 +26,14 @@ from app.services.auth import authenticate, github_sign_in, logout, request_code
 from app.quotas import ip_scope
 from app.services.snapshots import submit, get_snapshot, retry_snapshot
 from app.services.jobs import kick
+from app.services import chat_requests
 from app.services.rag import MAX_ANSWER_CHARS, AnswerLength, answer, answerable_suggestions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _app.state.chat_workers = anyio.CapacityLimiter(4)
     worker = None
     if settings.worker_mode == "inprocess":
         from app.services.worker_runtime import InProcessWorker
@@ -80,6 +83,7 @@ class HistoryTurn(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(max_length=max(MAX_ANSWER_CHARS, settings.max_question_chars))
 class ChatRequest(BaseModel):
+    requestId: uuid.UUID | None = None
     answerLength: AnswerLength = "default"
     question: str = Field(min_length=1, max_length=settings.max_question_chars)
     history: list[HistoryTurn] = Field(default_factory=list, max_length=settings.max_history_turns)
@@ -192,7 +196,9 @@ def snapshot_summary(snapshot_id: str, _user: User = Depends(current_user), db: 
     return {"sha": s.sha, "summary": summary}
 
 @app.post("/api/snapshots/{snapshot_id}/chat")
-async def snapshot_chat(snapshot_id: str, body: ChatRequest, token: str | None = Depends(bearer)):
+async def snapshot_chat(snapshot_id: str, body: ChatRequest, request: Request, token: str | None = Depends(bearer)):
+    if body.requestId is not None:
+        return await _keyed_chat(snapshot_id, body, token, getattr(request.app.state, "chat_workers", None))
     with chat_deadline(settings.chat_timeout_seconds):
         try:
             # Own the session inside the thread. On timeout the response can finish
@@ -201,6 +207,39 @@ async def snapshot_chat(snapshot_id: str, body: ChatRequest, token: str | None =
                 return await anyio.to_thread.run_sync(_chat_work, snapshot_id, body, token, abandon_on_cancel=True)
         except TimeoutError as exc:
             raise timeout_error() from exc
+
+
+_chat_tasks: set[asyncio.Task] = set()
+
+
+async def _run_keyed_chat(limiter, *args):
+    try:
+        await anyio.to_thread.run_sync(chat_requests.run_reserved, *args, limiter=limiter)
+    except Exception:
+        logger.exception("Could not persist reserved chat result")
+
+
+async def _keyed_chat(snapshot_id: str, body: ChatRequest, token: str | None, limiter):
+    request_id = str(body.requestId)
+    payload = (body.question, [turn.model_dump() for turn in body.history], body.answerLength)
+    with chat_deadline(settings.chat_timeout_seconds):
+        try:
+            result, reservation = await anyio.to_thread.run_sync(
+                chat_requests.admit, snapshot_id, request_id, *payload, token,
+            )
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) == "57014":
+                raise timeout_error() from exc
+            raise
+    if reservation:
+        task = asyncio.create_task(_run_keyed_chat(limiter, *reservation, request_id, snapshot_id, *payload))
+        _chat_tasks.add(task)
+        task.add_done_callback(_chat_tasks.discard)
+    if result is None:
+        return JSONResponse(status_code=202, content={"status": "running"})
+    if "error" in result:
+        return JSONResponse(status_code=result["status"], content={"error": result["error"]})
+    return result["answer"]
 
 
 def _chat_work(snapshot_id: str, body: ChatRequest, token: str | None) -> dict:

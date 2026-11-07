@@ -37,6 +37,15 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     __table_args__ = (CheckConstraint("email IS NOT NULL OR github_id IS NOT NULL", name="ck_user_identity"),)
 
+class ChatRequestRecord(Base):
+    __tablename__ = "chat_requests"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    result: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+
+
 class CodeChallenge(Base):
     __tablename__ = "code_challenges"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)

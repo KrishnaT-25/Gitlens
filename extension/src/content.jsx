@@ -31,7 +31,12 @@ const styles = `
 function Widget({ repo }) {
   const [answerLength, setAnswerLength] = useState('default');
   const [failedChat, setFailedChat] = useState(null);
-  const [open, setOpen] = useState(false), [expanded, setExpanded] = useState(false), [signedIn, setSignedIn] = useState(null), [snapshot, setSnapshot] = useState(null);
+  const [open, setOpen] = useState(false), [expanded, setExpanded] = useState(false), [signedIn, setSignedIn] = useState(null), [storedSnapshot, setSnapshot] = useState(null);
+  const [resolvedUrl, setResolvedUrl] = useState(null);
+  const [resolutionError, setResolutionError] = useState('');
+  const conversation = useRef(null);
+  const authEpoch = useRef(0);
+  const snapshot = !repo.unsupportedReason && resolvedUrl === repo.url ? storedSnapshot : null;
   const [summary, setSummary] = useState(null), [messages, setMessages] = useState([]), [question, setQuestion] = useState('');
   const [error, setError] = useState(''), [busy, setBusy] = useState(false), [serverStatus, setServerStatus] = useState('');
   const closeRef = useRef(null), bodyRef = useRef(null), tailRef = useRef(null), textareaRef = useRef(null), atBottomRef = useRef(true);
@@ -45,39 +50,68 @@ function Widget({ repo }) {
     globalThis.chrome.runtime.onMessage.addListener(onStatus);
     return () => globalThis.chrome.runtime.onMessage.removeListener(onStatus);
   }, []);
-  useEffect(() => { setSnapshot(null); setSummary(null); setMessages([]); setAnswerLength('default'); setFailedChat(null); setError(''); }, [repo.url]);
+  useEffect(() => () => { conversation.current = null; }, []);
+  function resetConversation(next = null) {
+    conversation.current = next;
+    setSummary(null);
+    setMessages([]);
+    setQuestion('');
+    setAnswerLength('default');
+    setFailedChat(null);
+    setError('');
+    setBusy(false);
+    atBottomRef.current = true;
+  }
   useEffect(() => {
     if (!open || repo.unsupportedReason) return;
     let cancelled = false;
+    const epoch = authEpoch.current;
+    const stale = () => cancelled || epoch !== authEpoch.current;
+    setResolutionError('');
     (async () => {
       try {
         const auth = await send({ type: 'GET_AUTH' });
-        if (cancelled) return;
+        if (stale()) return;
         setSignedIn(auth.signedIn);
         if (auth.signedIn) {
           const result = await api('POST', '/api/repositories', { url: repo.url });
-          if (!cancelled) setSnapshot(result);
+          if (stale()) return;
+          const key = JSON.stringify([result.snapshotId, result.sha]);
+          if (conversation.current?.key !== key) resetConversation({ key });
+          setSnapshot(result);
+          setResolvedUrl(repo.url);
+        } else {
+          resetConversation();
+          setSnapshot(null);
+          setResolvedUrl(null);
         }
-      } catch (e) { if (!cancelled) setError(e.message); }
+      } catch (e) { if (!stale()) setResolutionError(e.message); }
     })();
     return () => { cancelled = true; };
   }, [open, repo.url]);
   useEffect(() => {
     if (!open || !snapshot || ['ready', 'failed', 'unsupported'].includes(snapshot.status)) return;
     let active = true;
+    const owner = conversation.current;
+    const current = () => active && owner === conversation.current;
     const poll = async () => {
-      try { const status = await api('GET', `/api/snapshots/${snapshot.snapshotId}/status`); if (active) setSnapshot(previous => ({ ...previous, ...status })); }
-      catch (e) { if (active) setError(e.message); }
+      try { const status = await api('GET', `/api/snapshots/${snapshot.snapshotId}/status`); if (current()) setSnapshot(previous => ({ ...previous, ...status })); }
+      catch (e) { if (current()) setError(e.message); }
     };
     const timer = setInterval(poll, 3000); poll();
     return () => { active = false; clearInterval(timer); };
   }, [open, snapshot?.snapshotId, snapshot?.status]);
   useEffect(() => {
     if (snapshot?.status !== 'ready' || summary) return;
+    let active = true;
+    const owner = conversation.current;
+    const current = () => active && owner === conversation.current;
     api('GET', `/api/snapshots/${snapshot.snapshotId}/summary`).then(x => {
+      if (!current()) return;
       const value = x?.summary;
       setSummary(value ? { ...value, uncertainty: typeof value.uncertainty === 'string' ? value.uncertainty.trim() : '' } : null);
-    }).catch(e => setError(e.message));
+    }).catch(e => { if (current()) setError(e.message); });
+    return () => { active = false; };
   }, [snapshot?.status, snapshot?.snapshotId, summary]);
   useEffect(() => {
     if (!open || !atBottomRef.current) { if (open) setShowJump(true); return; }
@@ -91,15 +125,34 @@ function Widget({ repo }) {
     const previous = lastQuestion < 0 ? [] : messages.slice(lastQuestion, lastQuestion + 2)
       .map(({ role, content }) => ({ role, content }));
     setMessages(old => [...old, { role: 'user', content: q }]);
-    await sendQuestion({ question: q, history: previous, answerLength });
+    await sendQuestion({ requestId: crypto.randomUUID(), question: q, history: previous, answerLength });
   }
   async function sendQuestion(request) {
     if (busy || !snapshot) return;
+    const owner = conversation.current;
     setBusy(true); setError(''); setFailedChat(null);
     try {
-      const result = await api('POST', `/api/snapshots/${snapshot.snapshotId}/chat`, request);
-      setMessages(old => [...old, { role: 'assistant', content: result.answer, citations: result.citations }]);
-    } catch (e) { setError(e.message); setFailedChat(request); } finally { setBusy(false); }
+      const deadline = performance.now() + 75_000;
+      const path = `/api/snapshots/${snapshot.snapshotId}/chat`;
+      while (owner === conversation.current && performance.now() < deadline) {
+        const result = await api('POST', path, request, deadline - performance.now()).catch(error => {
+          if (error.code !== 'chat_transport') throw error;
+          return { status: 'running' };
+        });
+        if (owner !== conversation.current) return;
+        if (result.status !== 'running') {
+          if (typeof result.answer !== 'string') throw new Error('GitLens returned an incomplete response. Try again.');
+          setMessages(old => [...old, { role: 'assistant', content: result.answer, citations: result.citations }]);
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(1500, deadline - performance.now()))));
+      }
+      throw new Error('The chat did not finish in time. Retry answer checks the same request.');
+    } catch (e) {
+      if (owner !== conversation.current) return;
+      setError(e.message);
+      setFailedChat(e.terminal || e.code === 'chat_timeout' ? { ...request, requestId: crypto.randomUUID() } : request);
+    } finally { if (owner === conversation.current) setBusy(false); }
   }
   function ask(event) { event.preventDefault(); submitQuestion(question); }
   function resizeQuestion(value) {
@@ -127,11 +180,23 @@ function Widget({ repo }) {
     else body.scrollTop = body.scrollHeight;
   }
   async function signOut() {
+    authEpoch.current += 1;
     setBusy(true); setError('');
     try {
       await send({ type: 'LOGOUT' });
     } catch (e) { setError(e.message); }
-    finally { setSignedIn(false); setSnapshot(null); setSummary(null); setMessages([]); setAnswerLength('default'); setFailedChat(null); setBusy(false); }
+    finally { resetConversation(); setSignedIn(false); setSnapshot(null); setResolvedUrl(null); setResolutionError(''); }
+  }
+  async function retryAnalysis() {
+    const owner = conversation.current;
+    try {
+      const result = await api('POST', `/api/snapshots/${snapshot.snapshotId}/retry`);
+      if (owner !== conversation.current) return;
+      setSnapshot(previous => ({ ...previous, ...result }));
+      setError('');
+    } catch (e) {
+      if (owner === conversation.current) setError(e.message);
+    }
   }
   return <>
     <button className="launcher" aria-label={open ? 'Close GitLens' : 'Open GitLens'} aria-expanded={open} onClick={() => setOpen(!open)}><span aria-hidden="true">GL</span></button>
@@ -140,18 +205,20 @@ function Widget({ repo }) {
       <div className="body" ref={bodyRef} onScroll={onBodyScroll}>
         {signedIn === false && <div className="empty-state"><h2>Welcome to GitLens</h2><p>Sign in to explore this public repository and ask questions about its code.</p><button className="primary" onClick={() => send({ type: 'OPEN_AUTH' }).catch(e => setError(e.message))}>Continue with GitHub</button></div>}
         {repo.unsupportedReason && <div className="empty-state" role="alert"><h2>Unsupported GitHub page</h2><p>{repo.unsupportedReason}</p></div>}
-        {signedIn === null && !error && !repo.unsupportedReason && <div className="empty-state"><h2>Connecting to GitLens</h2><p>Checking your sign-in and preparing this repository…</p></div>}
+        {signedIn === null && !resolutionError && !repo.unsupportedReason && <div className="empty-state"><h2>Connecting to GitLens</h2><p>Checking your sign-in and preparing this repository…</p></div>}
+        {signedIn && !snapshot && !resolutionError && !repo.unsupportedReason && <p className="status-card" role="status">Resolving the repository snapshot…</p>}
+        {resolutionError && !repo.unsupportedReason && <p className="error" role="alert">{resolutionError}</p>}
         {serverStatus && <p className="muted" role="status">{serverStatus}</p>}
         {snapshot && !['ready','failed','unsupported'].includes(snapshot.status) && <p className="status-card" role="status">Preparing repository snapshot: {snapshot.status}.</p>}
-        {snapshot?.status === 'failed' && <div className="empty-state"><h2>Analysis needs another try</h2><p>The repository analysis did not finish successfully.</p><button className="primary" onClick={async () => { try { const result = await api('POST', `/api/snapshots/${snapshot.snapshotId}/retry`); setSnapshot(previous => ({ ...previous, ...result })); setError(''); } catch (e) { setError(e.message); } }}>Retry analysis</button></div>}
+        {snapshot?.status === 'failed' && <div className="empty-state"><h2>Analysis needs another try</h2><p>The repository analysis did not finish successfully.</p><button className="primary" onClick={retryAnalysis}>Retry analysis</button></div>}
         {snapshot?.status === 'unsupported' && <div className="empty-state"><h2>Repository is too large to analyze</h2><p>This repository cannot be analyzed within the current limits.</p></div>}
-        {summary && <div className="summary"><h2>Repository overview</h2><p>{summary.purpose}</p>{summary.components?.length > 0 && <><h3>Components</h3><ul>{summary.components.map((x,i) => <li key={i}>{x}</li>)}</ul></>}{summary.entrypoints?.length > 0 && <><h3>Entry points</h3><ul>{summary.entrypoints.map((x,i) => <li key={i}>{x}</li>)}</ul></>}{summary.technologies?.length > 0 && <><h3>Technologies</h3><ul>{summary.technologies.map((x,i) => <li key={i}>{x}</li>)}</ul></>}{summary.uncertainty && <p className="uncertainty">{summary.uncertainty}</p>}{summary.suggestedQuestions?.length > 0 && <><h3>Suggested questions</h3><div className="suggestions">{summary.suggestedQuestions.map((x,i) => <button className="suggestion" key={i} disabled={busy} onClick={() => submitQuestion(x)}>{x}</button>)}</div></>}</div>}
-        <div className="conversation" role="log" aria-live="polite" aria-label="Conversation">
+        {snapshot && summary && <div className="summary"><h2>Repository overview</h2><p>{summary.purpose}</p>{summary.components?.length > 0 && <><h3>Components</h3><ul>{summary.components.map((x,i) => <li key={i}>{x}</li>)}</ul></>}{summary.entrypoints?.length > 0 && <><h3>Entry points</h3><ul>{summary.entrypoints.map((x,i) => <li key={i}>{x}</li>)}</ul></>}{summary.technologies?.length > 0 && <><h3>Technologies</h3><ul>{summary.technologies.map((x,i) => <li key={i}>{x}</li>)}</ul></>}{summary.uncertainty && <p className="uncertainty">{summary.uncertainty}</p>}{summary.suggestedQuestions?.length > 0 && <><h3>Suggested questions</h3><div className="suggestions">{summary.suggestedQuestions.map((x,i) => <button className="suggestion" key={i} disabled={busy} onClick={() => submitQuestion(x)}>{x}</button>)}</div></>}</div>}
+        {(snapshot || !signedIn) && <div className="conversation" role="log" aria-live="polite" aria-label="Conversation">
           {messages.map((m,i) => <div className={`message ${m.role}`} key={i}><strong>{m.role === 'user' ? 'You' : <span className="ai-badge"><span className="ai-spark" aria-hidden="true">✦</span>GitLens AI</span>}</strong>{m.role === 'assistant' ? <AnswerMessage content={m.content} citations={m.citations} repo={repo} sha={snapshot?.sha}/> : <p>{m.content}</p>}</div>)}
           {busy && <div className="message assistant typing" role="status"><span>GitLens is checking repository context</span><span className="typing-dots" aria-hidden="true"><i/><i/><i/></span></div>}
           {error && <div className="error chat-error"><div role="alert">{error}</div>{failedChat && snapshot?.status === 'ready' && <button className="primary secondary" type="button" disabled={busy} onClick={() => sendQuestion(failedChat)}>Retry answer</button>}</div>}
           <div ref={tailRef} aria-hidden="true"/>
-        </div>
+        </div>}
         {showJump && <button className="jump-latest" type="button" onClick={jumpToLatest}>↓ Jump to latest</button>}
       </div>
       {snapshot?.status === 'ready' && <form className="foot answer-composer" onPointerDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()} onSubmit={ask}>
@@ -176,13 +243,21 @@ function sync() {
   if (url === current) return;
   current = url;
   const repo = parseRepositoryUrl(url);
-  if (root) { root.unmount(); root = null; host.remove(); host = null; }
-  if (!repo) return;
-  host = document.createElement('div'); host.id = 'gitlens-root';
-  const shadow = host.attachShadow({ mode: 'closed' });
-  const style = document.createElement('style'); style.textContent = styles; shadow.appendChild(style);
-  const mount = document.createElement('div'); shadow.appendChild(mount); document.documentElement.appendChild(host);
-  root = createRoot(mount); root.render(<Widget repo={repo}/>);
+  if (!repo) {
+    if (root) { root.unmount(); root = null; host.remove(); host = null; }
+    return;
+  }
+  if (!root) {
+    host = document.createElement('div'); host.id = 'gitlens-root';
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const style = document.createElement('style'); style.textContent = styles; shadow.appendChild(style);
+    const mount = document.createElement('div'); shadow.appendChild(mount); document.documentElement.appendChild(host);
+    root = createRoot(mount);
+  }
+  const page = new URL(repo.url);
+  repo.url = page.origin + page.pathname;
+  const key = JSON.stringify([repo.owner.toLowerCase(), repo.name.toLowerCase()]);
+  root.render(<Widget key={key} repo={repo}/>);
 }
 sync();
 addEventListener('popstate', sync);
