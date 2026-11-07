@@ -1,7 +1,7 @@
 import logging
 import uuid
 from datetime import timedelta
-from sqlalchemy import select, delete, text
+from sqlalchemy import select, delete, func, literal, text, update
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 from app.db import SessionLocal
@@ -15,7 +15,26 @@ from app.services.rag import make_summary, structural_summary, summarize_reposit
 from app.adapters.embeddings import embed_texts, embedding_profile, validate_vectors
 
 logger = logging.getLogger(__name__)
-PERMANENT = {"archive_too_large", "repository_too_large", "empty_repository", "unsafe_archive", "unsupported_repository"}
+PERMANENT = {"archive_too_large", "repository_too_large", "empty_repository", "unsafe_archive", "unsupported_repository", "index_schema_downgrade"}
+LEASE_DURATION = timedelta(minutes=15)
+
+
+class LeaseLost(Exception):
+    """The worker may no longer write results for this job."""
+
+
+def _lock_lease(db: Session, job_id: str, lease_token: str) -> Job:
+    job = db.get(Job, job_id, populate_existing=True, with_for_update=True)
+    if (job is None or job.status != "running" or job.lease_token != lease_token
+            or job.lease_until is None or job.lease_until <= now()):
+        raise LeaseLost
+    return job
+
+
+def _renew_lease(db: Session, job_id: str, lease_token: str) -> Job:
+    job = _lock_lease(db, job_id, lease_token)
+    job.lease_until = now() + LEASE_DURATION
+    return job
 
 def kick(db: Session, snapshot_id: str) -> None:
     _queue_embedding_rebuild(db, snapshot_id)
@@ -72,29 +91,37 @@ def _queue_embedding_rebuild(db: Session, snapshot_id: str) -> None:
 def claim(db: Session) -> tuple[str, str] | None:
     exhausted = db.execute(select(Job).where(
         Job.status == "running", Job.attempts >= 3, Job.lease_until < now(),
-    ).order_by(Job.lease_until, Job.id).with_for_update(skip_locked=True).limit(1)).scalar_one_or_none()
+    ).order_by(Job.lease_until, Job.id).with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True).limit(1)).scalar_one_or_none()
     if exhausted:
         exhausted.status = "failed"
         exhausted.error_code = exhausted.error_code or "processing_failed"
         exhausted.lease_until = None
         exhausted.lease_token = None
-        exhausted_snapshot = db.get(Snapshot, exhausted.snapshot_id)
-        if exhausted_snapshot.status != "ready":
+        exhausted_snapshot = db.get(Snapshot, exhausted.snapshot_id, populate_existing=True)
+        if exhausted_snapshot.summary is None:
             exhausted_snapshot.status = "failed"
             exhausted_snapshot.error_code = exhausted.error_code
+        else:
+            exhausted_snapshot.status = "ready"
+            exhausted_snapshot.error_code = None
         db.commit()
     job = db.execute(select(Job).where(
         Job.attempts < 3,
         ((Job.status == "queued") & (Job.next_attempt_at <= now())) | ((Job.status == "running") & (Job.lease_until < now())),
-    ).order_by(Job.next_attempt_at, Job.id).with_for_update(skip_locked=True).limit(1)).scalar_one_or_none()
+    ).order_by(Job.next_attempt_at, Job.id).with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True).limit(1)).scalar_one_or_none()
     if not job:
         return None
     job.status = "running"
     job.attempts += 1
-    job.lease_until = now() + timedelta(minutes=15)
+    job.lease_until = now() + LEASE_DURATION
     job.lease_token = str(uuid.uuid4())
-    snapshot = db.get(Snapshot, job.snapshot_id)
-    if snapshot.status not in {"summarizing", "ready"}:
+    snapshot = db.get(Snapshot, job.snapshot_id, populate_existing=True)
+    if snapshot.summary is not None:
+        snapshot.status = "ready"
+        snapshot.error_code = None
+    elif snapshot.status != "summarizing":
         snapshot.status = "indexing"
     db.commit()
     return job.id, job.lease_token
@@ -102,20 +129,24 @@ def claim(db: Session) -> tuple[str, str] | None:
 def process(job_id: str, lease_token: str):
     try:
         with SessionLocal() as db:
-            job = db.get(Job, job_id)
+            job = _renew_lease(db, job_id, lease_token)
             snapshot = db.get(Snapshot, job.snapshot_id)
             repository = db.get(Repository, snapshot.repository_id)
             target_version = settings.index_schema_version
-            staged = db.execute(select(Chunk.id).where(Chunk.snapshot_id == snapshot.id, Chunk.index_version == target_version).limit(1)).scalar_one_or_none()
-            if not staged:
+            published_version = snapshot.index_version if snapshot.summary is not None else None
+            if published_version is not None and target_version < published_version:
+                raise AppError("index_schema_downgrade", "The worker cannot replace a newer published index.", 409)
+            vector_repair = published_version == target_version
+            stage_version = -target_version if vector_repair else target_version
+            staged = db.scalar(select(Chunk.id).where(Chunk.snapshot_id == snapshot.id, Chunk.index_version == stage_version).limit(1))
+            if vector_repair and not staged:
+                _stage_repair_chunks(db, snapshot.id, target_version, stage_version)
+            db.commit()
+            if not vector_repair and not staged:
                 archive = download_archive(repository.owner, repository.name, snapshot.sha)
                 parsed = parse_repository(archive)
-                current = db.execute(select(Job).where(Job.id == job_id).with_for_update()).scalar_one()
-                db.refresh(current)
-                if current.lease_token != lease_token or current.status != "running":
-                    db.rollback()
-                    return
                 keyword_search = "bm25" if _pg_search_available(db) else "postgres_fts"
+                _renew_lease(db, job_id, lease_token)
                 _clear_staged(db, snapshot.id, target_version)
                 chunk_rows = [Chunk(snapshot_id=snapshot.id, path=c.path, line_start=c.line_start, line_end=c.line_end,
                                     text=c.text, index_version=target_version, language=c.language,
@@ -139,18 +170,19 @@ def process(job_id: str, lease_token: str):
                 root_node = db.execute(select(SnapshotNode).where(SnapshotNode.snapshot_id == snapshot.id,
                     SnapshotNode.index_version == target_version, SnapshotNode.path == "", SnapshotNode.node_type == "directory")).scalar_one()
                 root_node.metadata_json = {**(root_node.metadata_json or {}), "stagedIndexReport": staged_report}
-                snapshot.status = "indexing"
                 db.commit()
-            semantic = _embed_staged_chunks(db, snapshot.id, target_version, job_id, lease_token)
-            if semantic is None:
-                return
-            if snapshot.summary and snapshot.index_version == target_version:
+            embedding_report = _embed_staged_chunks(db, snapshot.id, stage_version, job_id, lease_token)
+            error = embedding_report["semanticErrorCode"]
+            if published_version is not None and error and (vector_repair or error != "embedding_unconfigured"):
+                raise AppError(error, "The replacement index could not complete embedding.", 503)
+            if vector_repair:
                 # Vector-only repairs reuse the exact existing text index/summary.
                 summary = snapshot.summary
                 summary_calls = (snapshot.index_report or {}).get("directorySummaryCalls", 0)
                 summary_mode = (snapshot.index_report or {}).get("repositorySummary", "cached")
             else:
-                summary_calls = summarize_repository_nodes(db, snapshot.id, target_version)
+                summary_calls = summarize_repository_nodes(
+                    db, snapshot.id, target_version, lambda: _renew_lease(db, job_id, lease_token))
                 try:
                     summary = make_summary(db, snapshot.id, target_version)
                     summary_mode = "gemini"
@@ -159,27 +191,29 @@ def process(job_id: str, lease_token: str):
                         raise
                     summary = structural_summary(db, snapshot.id, target_version)
                     summary_mode = "structural"
-            current = db.execute(select(Job).where(Job.id == job_id).with_for_update()
-                                 .execution_options(populate_existing=True)).scalar_one()
-            db.refresh(current)
-            if current.lease_token != lease_token or current.status != "running":
-                db.rollback()
-                return
+            job = _lock_lease(db, job_id, lease_token)
+            db.refresh(snapshot)
+            if vector_repair:
+                staged_report = snapshot.index_report or {}
+                _publish_repair_vectors(db, snapshot.id, target_version, stage_version)
+            else:
+                root_node = db.execute(select(SnapshotNode).where(SnapshotNode.snapshot_id == snapshot.id,
+                    SnapshotNode.index_version == target_version, SnapshotNode.path == "", SnapshotNode.node_type == "directory")).scalar_one()
+                staged_report = (root_node.metadata_json or {}).get("stagedIndexReport", {})
+                _remove_old_index(db, snapshot.id, target_version, published_version)
             snapshot.summary = summary
             snapshot.index_version = target_version
-            root_node = db.execute(select(SnapshotNode).where(SnapshotNode.snapshot_id == snapshot.id,
-                SnapshotNode.index_version == target_version, SnapshotNode.path == "", SnapshotNode.node_type == "directory")).scalar_one()
-            staged_report = (root_node.metadata_json or {}).get("stagedIndexReport", {})
-            snapshot.index_report = {**(snapshot.index_report or {}), **staged_report,
-                                     "version": target_version, "semantic": "ready" if semantic else "keyword_only",
+            snapshot.index_report = {**staged_report, **embedding_report, "version": target_version,
                                      "directorySummaryCalls": summary_calls, "repositorySummary": summary_mode}
             snapshot.status = "ready"
             snapshot.error_code = None
             job.status = "done"
+            job.error_code = None
             job.lease_until = None
             job.lease_token = None
-            _remove_old_index(db, snapshot.id, target_version)
             db.commit()
+    except LeaseLost:
+        return
     except AppError as exc:
         _fail(job_id, lease_token, exc.code, exc.code in PERMANENT)
     except Exception:
@@ -188,15 +222,20 @@ def process(job_id: str, lease_token: str):
 
 def _fail(job_id: str, lease_token: str, code: str, permanent: bool):
     with SessionLocal() as db:
-        job = db.execute(select(Job).where(Job.id == job_id).with_for_update()).scalar_one()
-        if job.lease_token != lease_token or job.status != "running":
+        try:
+            job = _lock_lease(db, job_id, lease_token)
+        except LeaseLost:
             return
         snapshot = db.get(Snapshot, job.snapshot_id)
         job.error_code = code
         job.lease_until = None
         job.lease_token = None
-        snapshot.error_code = code
-        has_usable_index = snapshot.status == "ready" and snapshot.summary is not None
+        has_usable_index = snapshot.summary is not None
+        if has_usable_index:
+            snapshot.status = "ready"
+            snapshot.error_code = None
+        else:
+            snapshot.error_code = code
         if permanent:
             job.status = "failed"
             if not has_usable_index:
@@ -242,34 +281,61 @@ def _persist_map(db: Session, snapshot_id: str, version: int, files: list) -> No
     for node in nodes:
         node.metadata_json = {**(node.metadata_json or {}), "children": sorted(children_by_parent.get(node.path, []))}
 
-def _embed_staged_chunks(db: Session, snapshot_id: str, version: int, job_id: str, lease_token: str) -> bool | None:
+def _repair_chunk_id():
+    return func.md5(literal("gitlens:embedding-repair:") + Chunk.id)
+
+
+def _stage_repair_chunks(db: Session, snapshot_id: str, version: int, stage_version: int) -> None:
+    """Give replacement vectors private chunk IDs while keeping published IDs stable."""
+    source = (Chunk.snapshot_id == snapshot_id, Chunk.index_version == version)
+    db.execute(insert(Chunk).from_select(
+        ["id", "snapshot_id", "index_version", "path", "line_start", "line_end", "text", "language", "symbol_path", "syntax_kind"],
+        select(_repair_chunk_id(), Chunk.snapshot_id, literal(stage_version), Chunk.path,
+               Chunk.line_start, Chunk.line_end, Chunk.text, Chunk.language, Chunk.symbol_path, Chunk.syntax_kind)
+        .where(*source),
+    ))
+    db.execute(insert(ChunkEmbedding).from_select(
+        ["id", "chunk_id", "model", "fingerprint", "dimensions", "format_version", "embedding"],
+        select(func.gen_random_uuid().cast(ChunkEmbedding.id.type), _repair_chunk_id(), ChunkEmbedding.model,
+               ChunkEmbedding.fingerprint, ChunkEmbedding.dimensions, ChunkEmbedding.format_version, ChunkEmbedding.values)
+        .join(Chunk, Chunk.id == ChunkEmbedding.chunk_id)
+        .where(*source, _compatible_embeddings(embedding_profile())),
+    ))
+
+
+def _publish_repair_vectors(db: Session, snapshot_id: str, version: int, stage_version: int) -> None:
+    """Swap vectors in the publication transaction and remove the repair workspace."""
+    source = (Chunk.snapshot_id == snapshot_id, Chunk.index_version == version)
+    db.execute(delete(ChunkEmbedding).where(ChunkEmbedding.chunk_id.in_(select(Chunk.id).where(*source))))
+    db.execute(update(ChunkEmbedding).where(*source, ChunkEmbedding.chunk_id == _repair_chunk_id())
+               .values(chunk_id=Chunk.id).execution_options(synchronize_session=False))
+    _clear_staged(db, snapshot_id, stage_version)
+
+
+def _compatible_embeddings(profile: dict):
+    return ((ChunkEmbedding.fingerprint == profile["fingerprint"])
+            & (ChunkEmbedding.model == profile["model"])
+            & (ChunkEmbedding.dimensions == profile["dimensions"])
+            & (ChunkEmbedding.format_version == profile["formatVersion"]))
+
+
+def _embed_staged_chunks(db: Session, snapshot_id: str, version: int, job_id: str, lease_token: str) -> dict:
     """Checkpoint only compatible validated batches, under the current worker lease."""
     profile = embedding_profile()
-    current = db.execute(select(Job).where(Job.id == job_id).with_for_update()
-                         .execution_options(populate_existing=True)).scalar_one()
-    if current.status != "running" or current.lease_token != lease_token:
-        db.rollback()
-        return None
-    snapshot = db.get(Snapshot, snapshot_id)
-    def report(state: str, reason: str | None = None) -> None:
-        snapshot.index_report = {**(snapshot.index_report or {}), "embedding": profile,
-                                 "embeddingRepairAttempt": profile["fingerprint"],
-                                 "semantic": state, "semanticErrorCode": reason}
+    _renew_lease(db, job_id, lease_token)
+
+    def report(state: str, reason: str | None = None) -> dict:
+        return {"embedding": profile, "embeddingRepairAttempt": profile["fingerprint"],
+                "semantic": state, "semanticErrorCode": reason}
 
     # Includes old vectors with no fingerprint. Never reuse them by chunk ID alone.
     ids = select(Chunk.id).where(Chunk.snapshot_id == snapshot_id, Chunk.index_version == version)
-    compatible = ((ChunkEmbedding.fingerprint == profile["fingerprint"])
-                  & (ChunkEmbedding.model == profile["model"])
-                  & (ChunkEmbedding.dimensions == profile["dimensions"])
-                  & (ChunkEmbedding.format_version == profile["formatVersion"]))
+    compatible = _compatible_embeddings(profile)
     db.execute(delete(ChunkEmbedding).where(ChunkEmbedding.chunk_id.in_(ids),
                (ChunkEmbedding.fingerprint.is_(None)) | ~compatible))
-    report("pending")
-    if not settings.gemini_api_key:
-        report("keyword_only", "embedding_unconfigured")
-        db.commit()
-        return False
     db.commit()
+    if not settings.gemini_api_key:
+        return report("keyword_only", "embedding_unconfigured")
     chunks = db.execute(select(Chunk).where(Chunk.snapshot_id == snapshot_id, Chunk.index_version == version)
                         .order_by(Chunk.path, Chunk.line_start)).scalars().all()
     embedded = set(db.execute(select(ChunkEmbedding.chunk_id).join(Chunk, Chunk.id == ChunkEmbedding.chunk_id)
@@ -284,21 +350,9 @@ def _embed_staged_chunks(db: Session, snapshot_id: str, version: int, job_id: st
         except AppError as exc:
             if exc.code.startswith("embedding_"):
                 # Earlier batches are durable and the next leased run resumes them.
-                current = db.execute(select(Job).where(Job.id == job_id).with_for_update()
-                                     .execution_options(populate_existing=True)).scalar_one()
-                if current.status != "running" or current.lease_token != lease_token:
-                    db.rollback()
-                    return None
-                report("keyword_only", exc.code)
-                db.commit()
-                return False
+                return report("keyword_only", exc.code)
             raise
-        current = db.execute(select(Job).where(Job.id == job_id).with_for_update()
-                             .execution_options(populate_existing=True)).scalar_one()
-        if current.status != "running" or current.lease_token != lease_token:
-            db.rollback()
-            return None
-        current.lease_until = now() + timedelta(minutes=15)
+        _renew_lease(db, job_id, lease_token)
         db.add_all(ChunkEmbedding(chunk_id=chunk.id, model=profile["model"], fingerprint=profile["fingerprint"],
                                  dimensions=profile["dimensions"], format_version=profile["formatVersion"], values=vector)
                    for chunk, vector in zip(batch, vectors))
@@ -307,20 +361,13 @@ def _embed_staged_chunks(db: Session, snapshot_id: str, version: int, job_id: st
     final_count = db.execute(select(ChunkEmbedding.chunk_id).join(Chunk, Chunk.id == ChunkEmbedding.chunk_id)
                              .where(Chunk.snapshot_id == snapshot_id, Chunk.index_version == version, compatible)).scalars().all()
     complete = bool(total_count) and len(final_count) == len(total_count)
-    current = db.execute(select(Job).where(Job.id == job_id).with_for_update()
-                         .execution_options(populate_existing=True)).scalar_one()
-    if current.status != "running" or current.lease_token != lease_token:
-        db.rollback()
-        return None
-    report("ready" if complete else "keyword_only", None if complete else "embedding_incomplete")
-    db.commit()
-    return complete
+    return report("ready" if complete else "keyword_only", None if complete else "embedding_incomplete")
 
-def _remove_old_index(db: Session, snapshot_id: str, version: int) -> None:
-    db.execute(delete(Chunk).where(Chunk.snapshot_id == snapshot_id, Chunk.index_version != version))
-    db.execute(delete(SnapshotFile).where(SnapshotFile.snapshot_id == snapshot_id, SnapshotFile.index_version != version))
-    db.execute(delete(SnapshotNode).where(SnapshotNode.snapshot_id == snapshot_id, SnapshotNode.index_version != version))
-    db.execute(delete(SymbolReference).where(SymbolReference.snapshot_id == snapshot_id, SymbolReference.index_version != version))
+def _remove_old_index(db: Session, snapshot_id: str, version: int, previous_version: int | None) -> None:
+    # Readers can carry their original index version across chat transactions.
+    keep = {version} if previous_version is None else {version, previous_version}
+    for model in (Chunk, SnapshotFile, SnapshotNode, SymbolReference):
+        db.execute(delete(model).where(model.snapshot_id == snapshot_id, model.index_version.not_in(keep)))
 
 def _pg_search_available(db: Session) -> bool:
     try:

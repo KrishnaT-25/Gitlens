@@ -68,8 +68,15 @@ Vector distance is computed over a materialized set of compatible rows from that
 snapshot, rather than traversing a global HNSW graph containing other spaces.
 This is exact vector search bounded by the snapshot's chunk limit (default 5,000).
 Changing the model or formatting version triggers one repair on next submission
-or status access. Workers delete incompatible vectors and resume already
-checkpointed compatible batches. A vector-only repair reuses the cached summary.
+or status access. Workers build replacement vectors in a private index version
+and resume compatible checkpoints. A successful vector repair swaps vectors in
+one transaction and preserves the published chunk IDs and cached summary.
+
+Schema rebuilds keep the published snapshot ready while the job runs or retries.
+The worker retains the immediately previous schema version after publication so
+readers already using that version can finish. Rebuild errors stay on the job.
+Every staged checkpoint and publication locks and refreshes the job row to verify
+its current token and lease expiry before writing.
 
 Supported models are `gemini-embedding-2` and `gemini-embedding-001`; an optional
 `models/` prefix is normalized. Embedding 2 uses `title: … | text: …` documents
@@ -109,5 +116,94 @@ cross-space retrieval exclusion, and populated migration downgrade/upgrade.
 These checks do not measure live Gemini availability, quota or retrieval quality.
 
 ## Current limits
+
+Chat requests use a request-local monotonic deadline. The 60-second maximum is
+deliberately below the extension's 70-second response timeout; a larger server
+budget requires changing and releasing the client contract together. The API
+returns `chat_timeout` (504) at the overall deadline instead of waiting through
+four independent 40-second model calls. Provider HTTP timeouts, embedding
+batches and retry sleeps use the remaining shared budget. Worker ingestion runs
+outside this chat context and keeps its existing limits.
+
+SQL statement timeouts are transaction-local and re-clamped before each query,
+so pooled connections retain their normal settings after commit/rollback. The
+chat thread owns its database session, including authentication and cleanup.
+When the HTTP deadline expires, an already blocking synchronous operation may
+finish bounded cleanup in that thread; its session is not closed underneath it,
+and deadline checks prevent further tool/model calls or late answers. No hard
+thread termination is used. Provider overload and rate-limit handling are
+handled by the bounded generation retry policy below.
+
+Regression checks in `tests/test_chat_deadline.py` use controlled clocks and
+mocked providers. PostgreSQL integration tests additionally verify cancellation
+of a real `pg_sleep` statement, authentication within the same budget, and
+connection/session cleanup. These checks are not live Gemini latency benchmarks.
+
+## Gemini generation retries and live comparison
+
+Chat lookups with initial evidence can complete in one model turn without a
+mandatory tool round-trip. The model can still inspect additional evidence before
+answering. Complex questions retain initial inspection and all existing turn,
+tool, context and deadline caps. This is a conservative routing heuristic, not a
+claim that short questions are always answerable.
+
+`CHAT_SIMPLE_THINKING=minimal` and `CHAT_COMPLEX_THINKING=medium` control chat
+reasoning effort; ordinary tool-based queries use low. Minimal is sent only for
+documented Flash-Lite models (3.5/3.1); other models safely use low for that
+request. Summary generation keeps its existing low setting. See
+[Google's thinking-level guidance](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
+
+Context compaction preserves admitted source coverage, chunk IDs and line ranges;
+it skips conflicting overlaps and never increases a chunk block's size. Global
+evidence limits are unchanged. The bounded repository map is navigation only,
+prioritizes relevant paths even beyond the alphabetical first 300 entries, and
+allows tools to expand omitted structure. `CHAT_MAP_CHARS=4000` is additionally
+bounded by the existing global map limit. Safe logs record routing, candidate and
+prompt character counts, duplicate/overlap counts, map length, model turns and
+tool calls without logging questions, source or credentials. Deterministic
+coverage/citation tests live in `tests/test_chat_context.py`; use live source-
+grounded comparisons to check answer completeness before lowering evidence caps.
+
+Summary generation and agent turns share the same transport policy: at most
+`GEMINI_MAX_RETRIES=2` additional attempts for HTTP **429/503**, with equal-jitter
+exponential backoff (base 1 second, maximum 8 seconds). Responses are closed
+before waiting or retrying. Only the failed model call is retried; tools and
+agent turns are not replayed. Other HTTP errors, malformed successful responses,
+and network timeouts are not automatically retried.
+
+`Retry-After` seconds/HTTP dates and `google.rpc.RetryInfo.retryDelay` are honored
+as minimum waits. A delay exceeding the configured maximum or leaving too little
+time for another attempt returns the original safe provider error instead of
+retrying early. Attempts share one operation deadline and the remaining chat
+deadline; a retry never resets either clock. Error bodies are read only up to
+16 KiB to inspect retry metadata and are never logged. No model, key, billing-tier
+or paid fallback is selected automatically.
+
+Run the separate live comparison from the repository root:
+
+```powershell
+python .\eval\benchmark_gemini.py --env-file .\server\.env
+```
+
+Use an existing **free-tier** API project. The script never enables billing or
+changes production settings. Google lists both reviewed model IDs on the
+[standard API free tier](https://ai.google.dev/gemini-api/docs/pricing.md);
+availability and project quotas still apply. Google AI Pro's student subscription
+benefits for AI Studio are [separate from API usage tiers](https://ai.google.dev/gemini-api/docs/google-ai-plans).
+
+The benchmark pairs `gemini-3.8-flash` and `gemini-3.5-flash-lite` on five fixed
+repository questions, using identical redacted source evidence from one commit,
+low thinking, a 3,000-token output cap and a forced `final_answer` tool call.
+Model order alternates between questions. Defaults are one round and a six-second
+pause between calls; `--rounds 2` repeats the sample. JSON results checkpoint after
+each case; the final CSV comparison is written under ignored `eval/results/`.
+
+Compare provider success counts alongside median/p95 **successful-call** latency,
+retry counts, citation-ID validity and the saved answers. Fact checks are simple
+regex heuristics for manual review, not faithfulness/accuracy measurements. With
+only five cases, p95 is normally the largest successful latency. This evaluates
+one generation turn, not production retrieval, indexing, full agent loops or a
+production latency SLO. Mocked retry/deadline tests live in `server/tests/` and do
+not make live provider calls.
 
 Phase 1 supports only public repositories and source files within configured archive/file/text limits. Search is lexical PostgreSQL full-text search, so vocabulary mismatches can produce an evidence gap. No repository code is executed. Gemini's free tier has provider limits and may use submitted data to improve Google products; review current provider terms before inviting users. Render Free sleeps after 15 minutes of inactivity, so the first request can take around a minute; the extension displays a waking status and retries readiness. Render can suspend a free service for excessive outbound traffic or exhausted free hours. Neon has free quotas. A complete hosted smoke run requires those accounts and credentials in their dashboards.

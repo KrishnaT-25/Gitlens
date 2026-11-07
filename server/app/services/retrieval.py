@@ -1,25 +1,22 @@
 import re
-from sqlalchemy import select, func, literal_column, text
+from sqlalchemy import bindparam, cast, select, func, literal_column
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
-from app.models import Chunk, Snapshot, ChunkEmbedding
+from app.models import Chunk, Snapshot, ChunkEmbedding, Vector768
 from app.config import settings
 from app.adapters.embeddings import embed_texts, embedding_profile, semantic_status, validate_vectors
 from app.errors import AppError
+from app.deadlines import check_deadline
 
 STOP_WORDS = {"a", "about", "an", "and", "are", "can", "could", "describe", "do", "does", "for", "from", "give", "how", "in", "is", "it", "me", "of", "on", "or", "please", "should", "show", "tell", "the", "this", "to", "use", "used", "what", "where", "which", "who", "why", "with", "would"}
 SYNONYM_GROUPS = (
-    ("api", "apis", "endpoint", "endpoints", "route", "routes", "handler", "handlers"),
-    ("auth", "authentication", "authorization", "login", "logout", "session", "sessions"),
-    ("bug", "bugs", "error", "errors", "exception", "exceptions", "failure", "failures"),
-    ("class", "classes", "struct", "structs", "type", "types"),
-    ("structure", "structures", "array", "arrays", "object", "objects", "map", "maps", "dictionary", "dict", "collection", "collections"),
-    ("config", "configuration", "settings", "environment"),
-    ("function", "functions", "method", "methods", "def", "func"),
-    ("test", "tests", "testing", "spec", "specs"),
-    ("dependency", "dependencies", "package", "packages", "library", "libraries"),
+    ("api", "apis", "endpoint", "endpoints", "route", "routes"),
+    ("auth", "authentication"),
+    ("error", "errors", "exception", "exceptions"),
+    ("config", "configuration", "settings"),
+    ("test", "tests", "testing"),
+    ("dependency", "dependencies", "package", "packages"),
     ("database", "db", "sql", "postgres", "postgresql"),
-    ("local", "localstorage", "storage", "persist", "persistence"),
-    ("session", "sessionstorage", "browser", "storage"),
 )
 SYNONYMS = {term: tuple(other for other in group if other != term) for group in SYNONYM_GROUPS for term in group}
 
@@ -27,11 +24,34 @@ FILE_REFERENCE = re.compile(r"(?<![\w.-])(?:[\w.-]+[\\/])*[\w.-]+\.[A-Za-z0-9]{1
 PATH_LINE_REFERENCE = re.compile(r"(?<![\w.-])((?:[\w.-]+[\\/])*[\w.-]+\.[A-Za-z0-9]{1,12}):L?(\d+)(?!\d)", re.IGNORECASE)
 LINE_REFERENCE = re.compile(r"\b(?:lines?|L)\s*(\d+)(?:\s*(?:-|to)\s*(?:L|line\s*)?(\d+))?\b", re.IGNORECASE)
 
-def _explicit_file_chunks(db: Session, snapshot_id: str, question: str, limit: int) -> list[Chunk]:
+LEXEME = re.compile(r"[A-Za-z0-9_]{2,}")
+PIPELINE_FLOW = re.compile(
+    r"\b(?:end[- ]to[- ]end|(?:whole|entire|full|complete)\s+(?:rag\s+)?pipeline|"
+    r"(?:explain|walk\s+(?:me\s+)?through)\s+(?:the\s+)?(?:rag\s+)?pipeline|"
+    r"how\s+does\s+(?:the\s+)?(?:rag\s+)?pipeline\s+work|"
+    r"(?:indexing|ingestion)\b.*\b(?:to|and|then)\s+(?:chat|answer(?:s|ing)?))\b",
+    re.IGNORECASE,
+)
+PIPELINE_STAGES = (
+    ("(ingest | ingestion | archive | download) & (chunk | chunks | index | indexing | embeddings)",
+     "job | worker | lease | persist | publish | commit"),
+    ("(chat | answer | answering) & (retrieval | retrieve | context | citation | citations | prompt)",
+     "agent | model | gemini | llm | generation | generate"),
+)
+AUXILIARY_PATH = r"(^|/)(docs?|examples?|eval|fixtures?|tests?)(/|$)|(^|/)(test_|smoke_)|\.(spec|test)\.|\.(md|mdx|rst|txt)$"
+
+
+def _scope(snapshot: Snapshot, path: str, symbol: str) -> tuple:
+    filters = [Chunk.snapshot_id == snapshot.id, Chunk.index_version == snapshot.index_version]
+    if path:
+        filters.append((Chunk.path == path) | Chunk.path.startswith(path + "/", autoescape=True))
+    if symbol:
+        filters.append(Chunk.symbol_path.icontains(symbol, autoescape=True))
+    return tuple(filters)
+
+
+def _explicit_file_chunks(db: Session, scope: tuple, question: str, limit: int) -> list[Chunk]:
     """Prioritize a file explicitly named in the question over broad keyword matches."""
-    snapshot = db.get(Snapshot, snapshot_id)
-    if not snapshot:
-        return []
     line_match = PATH_LINE_REFERENCE.search(question)
     line_range = None
     if line_match:
@@ -51,63 +71,90 @@ def _explicit_file_chunks(db: Session, snapshot_id: str, question: str, limit: i
         if "/" in reference:
             predicate = func.lower(Chunk.path) == reference
         else:
-            predicate = func.lower(Chunk.path).like(f"%/{reference}") | (func.lower(Chunk.path) == reference)
+            predicate = func.lower(Chunk.path).endswith("/" + reference, autoescape=True) | (func.lower(Chunk.path) == reference)
         if line_range:
             predicate = predicate & (Chunk.line_start <= line_range[1]) & (Chunk.line_end >= line_range[0])
         chunks = list(db.execute(
-            select(Chunk).where(Chunk.snapshot_id == snapshot_id, Chunk.index_version == snapshot.index_version, predicate)
-            .order_by(Chunk.line_start).limit(limit)
+            select(Chunk).where(*scope, predicate).order_by(Chunk.line_start, Chunk.path, Chunk.id).limit(limit)
         ).scalars())
         if chunks:
             return chunks
     return []
 
-def _terms(question: str) -> list[str]:
+def _direct_terms(question: str) -> list[str]:
     terms = []
-    for raw in re.findall(r"[A-Za-z0-9_]{2,}", question):
-        # Keep full identifiers and also split common code naming conventions.
+    for raw in LEXEME.findall(question):
+        # Keep identifiers and split common code naming conventions.
         parts = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw).replace("_", " ").split()
         for term in (raw.lower(), *(part.lower() for part in parts)):
-            if term not in STOP_WORDS and term not in terms:
+            if len(term) >= 2 and term not in STOP_WORDS and term not in terms:
                 terms.append(term)
-                terms.extend(x for x in SYNONYMS.get(term, ()) if x not in terms)
-            if len(terms) >= 24:
-                return terms[:24]
+                if len(terms) == 24:
+                    return terms
     return terms
 
-def search(db: Session, snapshot_id: str, question: str, limit: int = 8) -> list[Chunk]:
-    snapshot = db.get(Snapshot, snapshot_id)
-    if not snapshot:
+
+def _terms(question: str) -> list[str]:
+    direct = _direct_terms(question)
+    expansions = []
+    # Expand concepts in context, rather than turning generic words into broad OR queries.
+    for pattern, aliases in (
+        (r"\blocal\s+storage\b", ("localstorage",)),
+        (r"\bsession\s+storage\b", ("sessionstorage",)),
+        (r"\bdata\s+structures?\b", ("array", "object", "dict")),
+    ):
+        if re.search(pattern, question, re.IGNORECASE):
+            expansions.extend(aliases)
+    expansions.extend(alias for term in direct for alias in SYNONYMS.get(term, ()))
+    return list(dict.fromkeys([*direct, *expansions]))[:24]
+
+
+def _tsquery(expression: str):
+    return func.to_tsquery(literal_column("'simple'"), expression)
+
+
+def _fts(db: Session, scope: tuple, expression: str, limit: int, direct: list[str] | None = None, *,
+         stage_signal: str = "") -> list[Chunk]:
+    if not expression:
         return []
-    explicit_file = _explicit_file_chunks(db, snapshot_id, question, limit)
-    if explicit_file:
-        return explicit_file
-    terms = _terms(question)
-    if not terms:
-        return []
-    query = func.to_tsquery(literal_column("'simple'"), " | ".join(terms))
+    query = _tsquery(expression)
     vector = func.to_tsvector(literal_column("'simple'"), Chunk.path + literal_column("' '") + Chunk.text)
-    candidate_limit = min(64, max(limit * 4, limit))
-    stmt = select(Chunk).where(Chunk.snapshot_id == snapshot_id, Chunk.index_version == snapshot.index_version,
-        vector.op("@@")(query)).order_by(func.ts_rank_cd(vector, query).desc(), Chunk.path, Chunk.line_start).limit(candidate_limit)
-    candidates = list(db.execute(stmt).scalars())
-    # Favor relevant files before taking additional chunks from a single large file.
-    selected, paths = [], set()
-    for chunk in candidates:
-        if chunk.path not in paths:
-            selected.append(chunk)
-            paths.add(chunk.path)
-            if len(selected) == limit:
-                return selected
-    for chunk in candidates:
-        if any(existing.id == chunk.id for existing in selected):
-            continue
-        if any(existing.path == chunk.path and existing.line_start <= chunk.line_end and chunk.line_start <= existing.line_end for existing in selected):
+    ranks = [func.ts_rank_cd(vector, _tsquery(" | ".join(direct))).desc()] if direct else []
+    if stage_signal:
+        ranks.extend((Chunk.path.bool_op("~*")(AUXILIARY_PATH).asc(),
+                      vector.bool_op("@@")(_tsquery(stage_signal)).desc()))
+    stmt = (select(Chunk).where(*scope, vector.bool_op("@@")(query))
+            .order_by(*ranks, func.ts_rank_cd(vector, query).desc(), Chunk.path, Chunk.line_start, Chunk.id).limit(limit))
+    return list(db.scalars(stmt))
+
+
+def _select_evidence(ordered: list[Chunk], limit: int) -> list[Chunk]:
+    """Keep strong matches from the same file and discard near-identical line windows."""
+    selected = []
+    for chunk in ordered:
+        if any(
+            item.path == chunk.path
+            and item.line_start <= chunk.line_start and item.line_end >= chunk.line_end
+            for item in selected
+        ):
             continue
         selected.append(chunk)
         if len(selected) == limit:
             break
     return selected
+
+
+def search(db: Session, snapshot_id: str, question: str, limit: int = 8, *,
+           path: str = "", symbol: str = "") -> list[Chunk]:
+    """Rank keyword matches within the published index and any requested scope."""
+    snapshot = db.get(Snapshot, snapshot_id)
+    if not snapshot or limit <= 0:
+        return []
+    scope = _scope(snapshot, path, symbol)
+    exact = _explicit_file_chunks(db, scope, question, limit)
+    return exact or _select_evidence(_fts(db, scope, " | ".join(_terms(question)),
+                                         max(limit, min(64, limit * 4)), _direct_terms(question)), limit)
+
 
 def expand_context(db: Session, snapshot_id: str, anchors: list[Chunk], limit: int = 16) -> list[Chunk]:
     """Add nearest same-file chunks around matches within the exact snapshot boundary."""
@@ -136,110 +183,122 @@ def expand_context(db: Session, snapshot_id: str, anchors: list[Chunk], limit: i
     context = [entry[1] for entry in sorted(candidates.values(), key=lambda entry: (entry[0], entry[1].path, entry[1].line_start))]
     return sorted([*anchors, *context[:max(0, limit - len(anchors))]], key=lambda chunk: (chunk.path, chunk.line_start))
 
-def hybrid_search_scored(db: Session, snapshot_id: str, question: str, limit: int = 8) -> list[tuple[Chunk, float]]:
-    """Return snapshot-scoped ranked chunks and their reciprocal-rank/local-rerank scores."""
-    snapshot = db.get(Snapshot, snapshot_id)
-    if not snapshot:
+def _keyword_ids(db: Session, scope: tuple, question: str, limit: int, mode: str | None) -> list[str]:
+    terms = _terms(question)
+    if terms and mode == "bm25":
+        query = " ".join(terms)
+        stmt = (select(Chunk.id).where(*scope, Chunk.text.bool_op("@@@")(query)
+                                      | Chunk.path.bool_op("@@@")(query) | Chunk.symbol_path.bool_op("@@@")(query))
+                .order_by(func.paradedb.score(Chunk.id).desc(), Chunk.path, Chunk.line_start, Chunk.id).limit(limit))
+        try:
+            with db.begin_nested():
+                ids = list(db.scalars(stmt))
+            if ids:
+                return ids
+        except DBAPIError:
+            # An unavailable optional extension must not invalidate the caller's transaction.
+            pass
+    return [chunk.id for chunk in _fts(db, scope, " | ".join(terms), limit, _direct_terms(question))]
+
+
+def _vector_ids(db: Session, scope: tuple, question: str, limit: int, report: dict) -> list[str]:
+    if semantic_status(report)["mode"] != "hybrid":
         return []
-    exact = _explicit_file_chunks(db, snapshot_id, question, limit)
-    if exact:
+    profile = embedding_profile()
+    compatible = (
+        select(ChunkEmbedding.chunk_id, ChunkEmbedding.values.label("embedding"))
+        .join(Chunk, Chunk.id == ChunkEmbedding.chunk_id)
+        .where(*scope, ChunkEmbedding.fingerprint == profile["fingerprint"],
+               ChunkEmbedding.model == profile["model"], ChunkEmbedding.dimensions == profile["dimensions"],
+               ChunkEmbedding.format_version == profile["formatVersion"])
+    )
+    if not db.scalar(compatible.with_only_columns(ChunkEmbedding.chunk_id).limit(1)):
+        return []
+
+    try:
+        vector = validate_vectors(embed_texts([question], "RETRIEVAL_QUERY"), 1)[0]
+        candidates = compatible.cte("compatible_embeddings").prefix_with("MATERIALIZED", dialect="postgresql")
+        query_vector = cast(bindparam("query_vector", vector, type_=Vector768()), Vector768())
+        stmt = (select(candidates.c.chunk_id)
+                .order_by(candidates.c.embedding.op("<=>")(query_vector), candidates.c.chunk_id).limit(limit))
+        with db.begin_nested():
+            return list(db.scalars(stmt))
+    except AppError as exc:
+        if exc.code == "chat_timeout":
+            raise
+    except DBAPIError:
+        pass
+    return []
+
+
+def _pipeline_anchors(db: Session, scope: tuple, question: str, limit: int) -> list[Chunk]:
+    if limit < 2 or not PIPELINE_FLOW.search(question):
+        return []
+    anchors = []
+    for expression, signal in PIPELINE_STAGES:
+        check_deadline()
+        hits = _fts(db, scope, expression, 1, stage_signal=signal)
+        if not hits:
+            return []  # Only reserve slots when the repository has evidence of both stages.
+        anchors.extend(hits)
+    return anchors
+
+
+def hybrid_search_scored(db: Session, snapshot_id: str, question: str, limit: int = 8, *,
+                         path: str = "", symbol: str = "") -> list[tuple[Chunk, float]]:
+    """Return ranked evidence from the published snapshot version and requested scope."""
+    check_deadline()
+    snapshot = db.get(Snapshot, snapshot_id)
+    if not snapshot or limit <= 0:
+        return []
+    scope = _scope(snapshot, path, symbol)
+    report = snapshot.index_report or {}
+    exact = _explicit_file_chunks(db, scope, question, limit)
+    anchors = [] if path or symbol or LINE_REFERENCE.search(question) or PATH_LINE_REFERENCE.search(question) else (
+        _pipeline_anchors(db, scope, question, limit)
+    )
+    if exact and not anchors:
         return [(chunk, 1.0 / rank) for rank, chunk in enumerate(exact, 1)]
 
     candidate_limit = min(80, max(limit * 6, 24))
-    bm25_ids: list[str] = []
-    terms = _terms(question)
-    keyword_mode = (snapshot.index_report or {}).get("keywordSearch")
-    if terms and keyword_mode == "bm25":
-        # pg_search is optional on free/self-hosted PostgreSQL. Its absence falls back to FTS.
-        search_text = " ".join(terms[:16])
-        try:
-            rows = db.execute(text("""
-                SELECT id FROM chunks
-                WHERE snapshot_id = :snapshot_id AND index_version = :version
-                  AND (text @@@ :query OR path @@@ :query OR symbol_path @@@ :query)
-                ORDER BY paradedb.score(id) DESC, path, line_start LIMIT :limit
-            """), {"snapshot_id": snapshot_id, "version": snapshot.index_version,
-                  "query": search_text, "limit": candidate_limit}).all()
-            bm25_ids = [row[0] for row in rows]
-        except Exception:
-            db.rollback()
-    if not bm25_ids:
-        bm25_ids = [chunk.id for chunk in search(db, snapshot_id, question, candidate_limit)]
+    keyword_ids = _keyword_ids(db, scope, question, candidate_limit, report.get("keywordSearch"))
+    vector_ids = _vector_ids(db, scope, question, candidate_limit, report)
+    all_ids = set(keyword_ids) | set(vector_ids)
+    by_id = {chunk.id: chunk for chunk in [*anchors, *exact]}
+    if all_ids:
+        by_id.update((chunk.id, chunk) for chunk in db.scalars(select(Chunk).where(*scope, Chunk.id.in_(all_ids))))
 
-    vector_ids: list[str] = []
-    profile = embedding_profile()
-    has_vectors = semantic_status(snapshot.index_report)["mode"] == "hybrid" and bool(
-        db.execute(select(ChunkEmbedding.chunk_id).join(Chunk, Chunk.id == ChunkEmbedding.chunk_id)
-                   .where(Chunk.snapshot_id == snapshot_id, Chunk.index_version == snapshot.index_version,
-                          ChunkEmbedding.fingerprint == profile["fingerprint"], ChunkEmbedding.model == profile["model"],
-                          ChunkEmbedding.dimensions == profile["dimensions"],
-                          ChunkEmbedding.format_version == profile["formatVersion"]).limit(1)).first())
-    if has_vectors and settings.gemini_api_key:
-        try:
-            vector = validate_vectors(embed_texts([question], "RETRIEVAL_QUERY"), 1)[0]
-            literal = "[" + ",".join(str(value) for value in vector) + "]"
-            rows = db.execute(text("""
-                WITH compatible_embeddings AS MATERIALIZED (
-                    SELECT ce.chunk_id, ce.embedding FROM chunk_embeddings ce
-                    JOIN chunks c ON c.id = ce.chunk_id
-                    WHERE c.snapshot_id = :snapshot_id AND c.index_version = :version
-                      AND ce.fingerprint = :fingerprint AND ce.model = :model
-                      AND ce.dimensions = :dimensions AND ce.format_version = :format_version
-                )
-                SELECT chunk_id FROM compatible_embeddings
-                ORDER BY embedding <=> CAST(:vector AS vector) LIMIT :limit
-            """), {"snapshot_id": snapshot_id, "version": snapshot.index_version,
-                  "vector": literal, "limit": candidate_limit, "fingerprint": profile["fingerprint"],
-                  "model": profile["model"], "dimensions": profile["dimensions"],
-                  "format_version": profile["formatVersion"]}).all()
-            vector_ids = [row[0] for row in rows]
-        except (AppError, Exception):
-            db.rollback()
-
-    all_ids = list(dict.fromkeys(bm25_ids + vector_ids))
-    if not all_ids:
-        return []
-    chunks = db.execute(select(Chunk).where(Chunk.id.in_(all_ids), Chunk.snapshot_id == snapshot_id,
-                                            Chunk.index_version == snapshot.index_version)).scalars().all()
-    by_id = {chunk.id: chunk for chunk in chunks}
-    ranks: dict[str, float] = {}
-    for ranking in (bm25_ids, vector_ids):
+    ranks: dict[str, float] = dict.fromkeys(by_id, 0.0)
+    for ranking in (keyword_ids, vector_ids):
         for rank, chunk_id in enumerate(ranking, 1):
-            ranks[chunk_id] = ranks.get(chunk_id, 0.0) + 1.0 / (60 + rank)
+            if chunk_id in ranks:
+                ranks[chunk_id] += 1.0 / (60 + rank)
+    # A small bounded bonus makes literal matches stronger than synonym-only hits.
+    terms = set(_direct_terms(question))
     question_lower = question.lower()
     line_match = LINE_REFERENCE.search(question)
-    for chunk_id in list(ranks):
-        chunk = by_id.get(chunk_id)
-        if not chunk:
-            continue
+    for chunk_id, chunk in by_id.items():
+        if terms:
+            lexemes = set(LEXEME.findall(f"{chunk.path} {chunk.symbol_path or ''} {chunk.text}".lower()))
+            ranks[chunk_id] += 0.008 * len(terms & lexemes) / len(terms)
         if chunk.path.lower() in question_lower:
             ranks[chunk_id] += 0.8
-        basename = chunk.path.rsplit("/", 1)[-1].lower()
-        if basename in question_lower:
+        if chunk.path.rsplit("/", 1)[-1].lower() in question_lower:
             ranks[chunk_id] += 0.45
         if chunk.symbol_path and any(part.lower() in question_lower for part in re.split(r"[./:]+", chunk.symbol_path) if len(part) > 2):
             ranks[chunk_id] += 0.4
         if line_match and chunk.line_start <= int(line_match.group(1)) <= chunk.line_end:
             ranks[chunk_id] += 1.0
-    ordered = sorted((by_id[cid] for cid in ranks if cid in by_id),
-                     key=lambda c: (-ranks[c.id], c.path, c.line_start))
-    # Keep the result diverse across files, then fill remaining slots with the next best evidence.
-    selected, paths = [], set()
-    for chunk in ordered:
-        if chunk.path not in paths:
-            selected.append(chunk)
-            paths.add(chunk.path)
-            if len(selected) >= limit:
-                return [(item, ranks[item.id]) for item in selected]
-    for chunk in ordered:
-        if chunk.id not in {item.id for item in selected} and not any(
-                item.path == chunk.path and item.line_start <= chunk.line_end and chunk.line_start <= item.line_end
-                for item in selected):
-            selected.append(chunk)
-            if len(selected) >= limit:
-                break
-    return [(chunk, ranks[chunk.id]) for chunk in selected]
+    # Reserve room for both stages ahead of generic or explicitly named matches.
+    stage_bonus = max(ranks.values(), default=0.0) + 0.001
+    for chunk_id in {chunk.id for chunk in anchors}:
+        ranks[chunk_id] += stage_bonus
+    ordered = sorted(by_id.values(), key=lambda c: (-ranks[c.id], c.path, c.line_start, c.id))
+    return [(chunk, ranks[chunk.id]) for chunk in _select_evidence(ordered, limit)]
 
-def hybrid_search(db: Session, snapshot_id: str, question: str, limit: int = 8) -> list[Chunk]:
-    """Compatibility wrapper returning chunks in the existing hybrid rank order."""
-    return [chunk for chunk, _score in hybrid_search_scored(db, snapshot_id, question, limit)]
+
+def hybrid_search(db: Session, snapshot_id: str, question: str, limit: int = 8, *,
+                  path: str = "", symbol: str = "") -> list[Chunk]:
+    """Return ranked chunks without scores."""
+    ranking = hybrid_search_scored(db, snapshot_id, question, limit, path=path, symbol=symbol)
+    return [chunk for chunk, _score in ranking]

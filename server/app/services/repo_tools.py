@@ -3,11 +3,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.errors import AppError
+from app.deadlines import check_deadline
 from app.models import Chunk, Snapshot, SnapshotFile, SnapshotNode, SymbolReference
 from app.services.retrieval import hybrid_search
 
 TOOL_DECLARATIONS = [
-    {"name": "search", "description": "Search indexed evidence in this exact repository snapshot.", "parameters": {"type": "OBJECT", "properties": {"query": {"type": "STRING"}, "path": {"type": "STRING"}, "symbol": {"type": "STRING"}}, "required": ["query"]}},
+    {"name": "search", "description": "Search indexed evidence in this snapshot. Optionally restrict to a file or directory path and a literal, case-insensitive symbol substring.", "parameters": {"type": "OBJECT", "properties": {"query": {"type": "STRING"}, "path": {"type": "STRING"}, "symbol": {"type": "STRING"}}, "required": ["query"]}},
     {"name": "read_file", "description": "Read a bounded line range from an indexed file in this snapshot.", "parameters": {"type": "OBJECT", "properties": {"path": {"type": "STRING"}, "start_line": {"type": "INTEGER"}, "end_line": {"type": "INTEGER"}}, "required": ["path"]}},
     {"name": "list_dir", "description": "List indexed immediate children of a repository directory.", "parameters": {"type": "OBJECT", "properties": {"path": {"type": "STRING"}}}},
     {"name": "find_references", "description": "Find indexed definitions and references to an exact symbol name.", "parameters": {"type": "OBJECT", "properties": {"symbol": {"type": "STRING"}}, "required": ["symbol"]}},
@@ -47,18 +48,17 @@ def _line_window(content: str, start_value, end_value, max_lines: int) -> tuple[
     return lines, start, end
 
 def execute_tool(db: Session, snapshot: Snapshot, name: str, args: dict, evidence: dict[str, Chunk]) -> dict:
+    check_deadline()
     version = snapshot.index_version
     if name == "search":
         query = str(args.get("query", "")).strip()[:settings.max_question_chars]
         path = safe_path(args.get("path"))
-        symbol = str(args.get("symbol", "")).strip()[:255]
+        symbol = str(args.get("symbol") or "").strip()[:255]
+        if "\x00" in symbol:
+            raise AppError("invalid_tool_symbol", "Repository symbol is invalid.", 400)
         if not query:
             return {"results": []}
-        chunks = hybrid_search(db, snapshot.id, query, 8)
-        if path:
-            chunks = [c for c in chunks if c.path == path or c.path.startswith(path + "/")]
-        if symbol:
-            chunks = [c for c in chunks if c.symbol_path and symbol.lower() in c.symbol_path.lower()]
+        chunks = hybrid_search(db, snapshot.id, query, 8, path=path, symbol=symbol)
         for chunk in chunks:
             evidence[chunk.id] = chunk
         return _bounded({"results": [{"chunkId": c.id, "path": c.path, "lineStart": c.line_start,

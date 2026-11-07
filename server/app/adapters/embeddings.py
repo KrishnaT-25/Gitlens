@@ -8,6 +8,7 @@ import httpx
 
 from app.config import settings
 from app.errors import AppError
+from app.deadlines import bounded_seconds, check_deadline, budgeted_sleep
 
 # Bump whenever document/query formatting, task instructions, or truncation changes.
 EMBEDDING_FORMAT_VERSION = 2
@@ -83,6 +84,7 @@ class _SplitBatch(Exception):
 def _send(client: httpx.Client, body: dict, deadline: float) -> list:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_embedding_model}:batchEmbedContents"
     for attempt in range(3):
+        check_deadline()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise AppError("embedding_timeout", "Embedding request timed out.", 503)
@@ -102,6 +104,7 @@ def _send(client: httpx.Client, body: dict, deadline: float) -> list:
                     raise AppError("embedding_response", "Embedding service returned an unsupported encoding.", 502)
                 payload = bytearray()
                 for piece in response.iter_bytes(chunk_size=8192):
+                    check_deadline()
                     if time.monotonic() > deadline:
                         raise AppError("embedding_timeout", "Embedding request timed out.", 503)
                     if len(payload) + len(piece) > settings.embedding_response_bytes:
@@ -114,7 +117,7 @@ def _send(client: httpx.Client, body: dict, deadline: float) -> list:
         delay = 2 ** attempt
         if time.monotonic() + delay >= deadline:
             raise AppError("embedding_timeout", "Embedding request timed out.", 503)
-        time.sleep(delay)
+        budgeted_sleep(delay)
     raise AssertionError("Unreachable retry state")
 
 
@@ -133,7 +136,7 @@ def embed_texts(texts: list[str], task_type: str, *, titles: list[str] | None = 
     if len(texts) > 100 or titles is not None and len(titles) != len(texts):
         raise ValueError("Invalid embedding batch size or titles")
     titles = titles if titles is not None else [""] * len(texts)
-    deadline = time.monotonic() + settings.embedding_deadline_seconds
+    deadline = time.monotonic() + bounded_seconds(settings.embedding_deadline_seconds)
 
     def batch(client: httpx.Client, inputs: list[str], labels: list[str]) -> list[list[float]]:
         body = _request_body(inputs, task_type, labels)
@@ -149,8 +152,11 @@ def embed_texts(texts: list[str], task_type: str, *, titles: list[str] | None = 
 
     try:
         with httpx.Client() as client:
-            return batch(client, texts, titles)
+            vectors = batch(client, texts, titles)
+            check_deadline()
+            return vectors
     except httpx.TimeoutException as exc:
+        check_deadline()
         raise AppError("embedding_timeout", "Embedding request timed out.", 503) from exc
     except httpx.RequestError as exc:
         raise AppError("embedding_unavailable", "Semantic search is temporarily unavailable.", 503) from exc

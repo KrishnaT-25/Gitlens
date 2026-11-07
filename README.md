@@ -68,3 +68,10 @@ Results go to timestamped files in `eval/results/` (ignored by Git): per-questio
 - **File Hit Rate@k**: fraction of questions where at least one expected source file appears in the top *k* chunks, even if the exact judged chunk did not. It can reveal chunk-boundary misses that chunk-level recall cannot distinguish.
 
 Run metric unit tests with `python -m pytest tests/test_ir_metrics.py` from `server/`.
+
+For a separate **live generation** comparison of Gemini 3.8 Flash and 3.5 Flash-Lite,
+run `python .\eval\benchmark_gemini.py --env-file .\server\.env` from the repository
+root with a free-tier API key already stored locally. Five paired source-grounded
+questions produce JSON answer/error records and a CSV comparison under
+`eval/results/`. This uses actual API calls; it is separate from mocked pytest
+checks and from the retrieval-only evaluator. See [benchmark scope and retry limits](docs/operations.md#gemini-generation-retries-and-live-comparison).

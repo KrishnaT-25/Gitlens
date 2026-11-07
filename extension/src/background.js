@@ -29,10 +29,22 @@ async function api(method, path, body, sender) {
   if (!['GET', 'POST'].includes(method) || !/^\/api\/(auth|repositories|snapshots)(\/|$)/.test(path)) throw new Error('Invalid API request.');
   await wakeApi(sender);
   const { token } = await chrome.storage.local.get('token');
+  // Server chat processing is capped at 60s; allow time for the error/answer
+  // to travel back. Cold-start readiness above has its own separate timeout.
+  const chat = method === 'POST' && /^\/api\/snapshots\/[^/]+\/chat$/.test(path);
+  const signal = AbortSignal.timeout(chat ? 70_000 : 28_000);
+  try { return await requestApi(method, path, body, token, signal); }
+  catch (error) {
+    if (signal.aborted) throw new Error(chat ? 'The chat request timed out. Please try a more focused question.' : 'The request timed out. Please try again.');
+    throw error;
+  }
+}
+
+async function requestApi(method, path, body, token, signal) {
   const response = await fetch(apiBase + path, {
     method,
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    signal: AbortSignal.timeout(28000),
+    signal,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const reader = response.body?.getReader();

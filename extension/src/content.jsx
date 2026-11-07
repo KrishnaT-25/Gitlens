@@ -77,7 +77,9 @@ function Widget({ repo }) {
   async function submitQuestion(value) {
     if (!value.trim() || busy || !snapshot) return;
     const q = value.trim(); setQuestion(''); setBusy(true); setError('');
-    const previous = messages.slice(-2).map(x => ({ role: x.role, content: x.content }));
+    const lastQuestion = messages.findLastIndex(message => message.role === 'user');
+    const previous = lastQuestion < 0 ? [] : messages.slice(lastQuestion, lastQuestion + 2)
+      .map(({ role, content }) => ({ role, content }));
     setMessages(old => [...old, { role: 'user', content: q }]);
     try {
       const result = await api('POST', `/api/snapshots/${snapshot.snapshotId}/chat`, { question: q, history: previous });

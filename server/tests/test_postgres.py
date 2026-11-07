@@ -189,7 +189,6 @@ def test_worker_retries_and_rejects_stale_lease(monkeypatch):
     monkeypatch.setattr(jobs, "download_archive", lambda *_args: make_zip("root/app.py", "def answer(): return 42"))
     monkeypatch.setattr(jobs, "make_summary", lambda *_args: {"purpose": "test"})
     monkeypatch.setattr(jobs, "summarize_repository_nodes", lambda *_args: None)
-    monkeypatch.setattr(jobs, "_embed_staged_chunks", lambda *_args: False)
     jobs.process(job_id, old_token)
     with SessionLocal() as db:
         assert db.get(Snapshot, snapshot_id).status == "indexing"
@@ -250,13 +249,60 @@ def make_zip(path, content):
     return out.getvalue()
 
 
-def embedding_fixture(db, count=5):
+def test_chat_deadline_cancels_sql_and_does_not_leak_to_pooled_connections():
+    """Real PostgreSQL statement cancellation; no model/provider involved."""
+    import time
+    from sqlalchemy.exc import DBAPIError
+    from app.deadlines import chat_deadline
+    with SessionLocal() as db:
+        db.execute(text("SELECT 1")); db.commit()
+        start = time.monotonic()
+        with chat_deadline(0.1), pytest.raises(DBAPIError) as error:
+            db.execute(text("SELECT pg_sleep(2)"))
+        elapsed = time.monotonic() - start
+        assert error.value.orig.sqlstate == "57014"
+        assert elapsed < 1
+        db.rollback()
+        assert db.scalar(text("SHOW statement_timeout")) == "0"
+        assert db.scalar(text("SELECT 1")) == 1
+
+
+def test_chat_deadline_covers_authentication_and_closes_its_own_session(monkeypatch):
+    import threading
+    import time
+    from app import main
+    closed = threading.Event()
+    original = main.get_db
+    def tracked_database():
+        try:
+            yield from original()
+        finally:
+            closed.set()
+    def slow_authentication(db, _token):
+        db.execute(text("SELECT pg_sleep(2)"))
+        pytest.fail("Authentication must not outlive the chat budget")
+    monkeypatch.setattr(main, "get_db", tracked_database)
+    monkeypatch.setattr(main, "authenticate", slow_authentication)
+    monkeypatch.setattr(main.settings, "chat_timeout_seconds", 0.1)
+    with TestClient(app) as client:
+        start = time.monotonic()
+        result = client.post("/api/snapshots/s/chat", json={"question": "test"}, headers={"Authorization": "Bearer mock-only"})
+        assert result.status_code == 504
+        assert result.json()["error"]["code"] == "chat_timeout"
+        assert time.monotonic() - start < 1
+        assert closed.wait(2)
+    with SessionLocal() as db:
+        assert db.scalar(text("SHOW statement_timeout")) == "0"
+
+
+def embedding_fixture(db, count=5, *, published=True):
     """Build a ready text index whose vectors can be repaired without reingestion."""
     from app.models import SnapshotNode
     repo = Repository(owner="embedding", name="fixture", canonical_url="https://github.com/embedding/fixture", default_branch="main")
     db.add(repo); db.flush()
-    snapshot = Snapshot(repository_id=repo.id, sha="a" * 40, status="ready", index_version=2,
-                        summary={"purpose": "cached"}, index_report={"keywordSearch": "postgres_fts", "semantic": "ready"})
+    snapshot = Snapshot(repository_id=repo.id, sha="a" * 40, status="ready" if published else "indexing", index_version=2,
+                        summary={"purpose": "cached"} if published else None,
+                        index_report={"keywordSearch": "postgres_fts", "semantic": "ready"} if published else None)
     db.add(snapshot); db.flush()
     chunks = [Chunk(snapshot_id=snapshot.id, index_version=2, path=f"file{i}.py",
                     line_start=1, line_end=1, text=f"source {i}") for i in range(count)]
@@ -268,6 +314,26 @@ def embedding_fixture(db, count=5):
     return snapshot, chunks, job
 
 
+def test_compact_repository_map_prioritizes_evidence_paths_and_exact_snapshot():
+    from app.models import SnapshotNode
+    with SessionLocal() as db:
+        snapshot, _chunks, _job = embedding_fixture(db, 1)
+        other = Snapshot(repository_id=snapshot.repository_id, sha="b" * 40, status="ready", summary={})
+        db.add(other); db.flush()
+        db.add_all([SnapshotNode(snapshot_id=snapshot.id, index_version=2, path=f"file{i:04}.py", parent_path="",
+                                node_type="file", summary="unrelated") for i in range(350)])
+        db.add_all([
+            SnapshotNode(snapshot_id=snapshot.id, index_version=2, path="zz/target.py", parent_path="zz", node_type="file", summary="Selected source"),
+            SnapshotNode(snapshot_id=snapshot.id, index_version=1, path="stale.py", parent_path="", node_type="file", summary="Wrong index"),
+            SnapshotNode(snapshot_id=other.id, index_version=2, path="other.py", parent_path="", node_type="file", summary="Wrong snapshot"),
+        ])
+        db.commit()
+        result = rag._repository_map(db, snapshot, ["zz/target.py"])
+        assert "FILE zz/target.py — Selected source" in result
+        assert "stale.py" not in result and "other.py" not in result
+        assert len(result) <= min(jobs.settings.chat_map_chars, jobs.settings.max_repo_map_chars)
+
+
 def test_embedding_rebuild_checkpoints_and_resumes_only_compatible_vectors(monkeypatch):
     """Real pgvector storage; the provider alone is mocked."""
     from app.adapters.embeddings import embedding_profile
@@ -276,7 +342,7 @@ def test_embedding_rebuild_checkpoints_and_resumes_only_compatible_vectors(monke
     monkeypatch.setattr(jobs.settings, "embedding_batch_size", 2)
     profile = embedding_profile()
     with SessionLocal() as db:
-        snapshot, chunks, job = embedding_fixture(db)
+        snapshot, chunks, job = embedding_fixture(db, published=False)
         for i, chunk in enumerate(chunks):
             values = {"model": profile["model"], "fingerprint": profile["fingerprint"],
                       "dimensions": 768, "format_version": profile["formatVersion"]}
@@ -294,18 +360,18 @@ def test_embedding_rebuild_checkpoints_and_resumes_only_compatible_vectors(monke
                 raise AppError("embedding_rate_limit", "mock capacity", 503)
             return [[1.0] + [0.0] * 767 for _ in texts]
         monkeypatch.setattr(jobs, "embed_texts", provider)
-        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is False
+        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner")["semanticErrorCode"] == "embedding_rate_limit"
         assert db.scalar(select(func.count()).select_from(ChunkEmbedding)) == 3
-        assert snapshot.index_report["semanticErrorCode"] == "embedding_rate_limit"
-        assert snapshot.status == "ready"
-        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is True
+        assert snapshot.index_report is None
+        assert snapshot.status == "indexing"
+        report = jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner")
         assert calls[-1][0] == ["source 2", "source 3"]
         assert calls[-1][1] == ["file2.py", "file3.py"]
         rows = db.scalars(select(ChunkEmbedding)).all()
         assert len(rows) == 5 and all(row.fingerprint == profile["fingerprint"] for row in rows)
         assert db.scalar(select(ChunkEmbedding.id).where(ChunkEmbedding.chunk_id == chunks[-1].id)) == retained
-        assert snapshot.index_report["semantic"] == "ready"
-        assert snapshot.index_report["semanticErrorCode"] is None
+        assert report["semantic"] == "ready"
+        assert report["semanticErrorCode"] is None
 
 
 @pytest.mark.parametrize("report_compatible", [False, True])
@@ -350,23 +416,26 @@ def test_embedding_worker_rejects_stolen_lease_and_invalid_vectors(monkeypatch):
     from app.models import ChunkEmbedding
     monkeypatch.setattr(jobs.settings, "gemini_api_key", "mock-only-key")
     with SessionLocal() as db:
-        snapshot, _chunks, job = embedding_fixture(db, 1)
+        snapshot, _chunks, job = embedding_fixture(db, 1, published=False)
         monkeypatch.setattr(jobs, "embed_texts", lambda *_args, **_kwargs: [[float("nan")] * 768])
-        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is False
-        assert snapshot.index_report["semanticErrorCode"] == "embedding_response"
+        report = jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner")
+        assert report["semanticErrorCode"] == "embedding_response"
         def provider(*_args, **_kwargs):
             with SessionLocal() as other:
                 other.get(Job, job.id).lease_token = "new-owner"
                 other.commit()
             return [[1.0] + [0.0] * 767]
         monkeypatch.setattr(jobs, "embed_texts", provider)
-        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is None
+        with pytest.raises(jobs.LeaseLost):
+            jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner")
+        db.rollback()
         assert db.scalar(select(func.count()).select_from(ChunkEmbedding)) == 0
 
 
 def test_embedding_repair_preserves_ready_index_and_cached_summary(monkeypatch):
     from app.adapters.embeddings import embedding_profile
     from app.main import snapshot_status
+    from app.models import ChunkEmbedding
     monkeypatch.setattr(jobs.settings, "gemini_api_key", "mock-only-key")
     monkeypatch.setattr(jobs.settings, "worker_mode", "separate")
     def forbidden(*_args): pytest.fail("Vector repair must reuse text and summary")
@@ -388,6 +457,9 @@ def test_embedding_repair_preserves_ready_index_and_cached_summary(monkeypatch):
         snapshot = db.get(Snapshot, sid)
         assert snapshot.status == "ready" and snapshot.summary == {"purpose": "cached"}
         assert db.get(Chunk, cid) is not None and db.get(Job, jid).status == "done"
+        vector = db.scalar(select(ChunkEmbedding).where(ChunkEmbedding.chunk_id == cid))
+        assert vector.fingerprint == embedding_profile()["fingerprint"]
+        assert db.scalar(select(func.count()).select_from(Chunk).where(Chunk.snapshot_id == sid, Chunk.index_version < 0)) == 0
         assert snapshot_status(sid, _user=None, db=db)["search"]["mode"] == "hybrid"
         assert snapshot.index_report["embedding"] == embedding_profile()
         # A new model schedules one repair; repeated polling preserves the job.
@@ -403,10 +475,160 @@ def test_missing_embedding_key_exposes_keyword_fallback(monkeypatch):
     from app.adapters.embeddings import semantic_status
     monkeypatch.setattr(jobs.settings, "gemini_api_key", "")
     with SessionLocal() as db:
-        snapshot, _chunks, job = embedding_fixture(db, 1)
-        assert jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner") is False
-        status = semantic_status(snapshot.index_report)
+        snapshot, _chunks, job = embedding_fixture(db, 1, published=False)
+        report = jobs._embed_staged_chunks(db, snapshot.id, 2, job.id, "owner")
+        status = semantic_status(report)
         assert status["mode"] == "keyword" and status["reason"] == "embedding_unconfigured"
+
+
+def test_chat_uses_published_index_during_schema_rebuild(monkeypatch):
+    from app.main import ChatRequest, _chat_work
+    from app.models import SnapshotFile
+    from app.services.repo_tools import execute_tool
+
+    monkeypatch.setattr(jobs.settings, "index_schema_version", 3)
+    monkeypatch.setattr(jobs.settings, "gemini_api_key", "")
+    monkeypatch.setattr(jobs, "download_archive", lambda *_: make_zip("root/replacement.py", "replacement_value = 42"))
+    with SessionLocal() as db:
+        snapshot, chunks, job = embedding_fixture(db, 1)
+        user = User(email="reader@example.com")
+        db.add(user)
+        db.flush()
+        token, _ = auth.issue_session(db, user.id)
+        sid, cid, jid = snapshot.id, chunks[0].id, job.id
+        original_report = dict(snapshot.index_report)
+        db.add(SnapshotFile(snapshot_id=sid, index_version=2, path="file0.py", content="source 0",
+                            line_count=1, byte_size=8))
+        db.commit()
+
+    monkeypatch.setattr(rag, "generate_tool_turn", lambda *_, **__: {
+        "content": {"parts": []}, "calls": [{"name": "final_answer", "args": {
+            "answer": "The published file is available.", "citedChunkIds": [cid], "insufficientEvidence": False}}],
+    })
+
+    def summarize(*_):
+        with SessionLocal() as reader:
+            visible = reader.get(Snapshot, sid)
+            assert (visible.status, visible.index_version, visible.summary) == ("ready", 2, {"purpose": "cached"})
+            assert visible.index_report == original_report
+            assert reader.scalar(select(Chunk.path).where(Chunk.snapshot_id == sid, Chunk.index_version == 3)) == "replacement.py"
+            answer = _chat_work(sid, ChatRequest(question="What is in file0.py?"), token)
+            assert answer["citations"][0]["path"] == "file0.py"
+        return {"purpose": "replacement"}
+
+    monkeypatch.setattr(jobs, "make_summary", summarize)
+    with SessionLocal() as reader:
+        previous = reader.get(Snapshot, sid)
+        reader.commit()
+        jobs.process(jid, "owner")
+        source = execute_tool(reader, previous, "read_file", {"path": "file0.py"}, {})
+        assert source["text"] == "1: source 0"
+    with SessionLocal() as db:
+        visible = db.get(Snapshot, sid)
+        assert (visible.status, visible.index_version, visible.summary) == ("ready", 3, {"purpose": "replacement"})
+        assert db.get(Job, jid).status == "done"
+        assert db.get(Chunk, cid) is not None  # A reader with the former version can finish.
+        assert [item.path for item in search(db, sid, "replacement_value")] == ["replacement.py"]
+
+
+@pytest.mark.parametrize("failure", ["permanent", "final_attempt", "expired_lease"])
+def test_failed_rebuild_preserves_published_data(monkeypatch, failure):
+    monkeypatch.setattr(jobs.settings, "index_schema_version", 3)
+    monkeypatch.setattr(jobs.settings, "gemini_api_key", "")
+    monkeypatch.setattr(jobs, "download_archive", lambda *_: make_zip("root/replacement.py", "replacement_value = 42"))
+    code = "unsafe_archive" if failure == "permanent" else "processing_failed"
+
+    def fail(*_):
+        raise AppError(code, "Replacement failed", 500)
+
+    monkeypatch.setattr(jobs, "make_summary", fail)
+    with SessionLocal() as db:
+        snapshot, chunks, job = embedding_fixture(db, 1)
+        if failure != "permanent":
+            job.attempts = 3
+        if failure == "expired_lease":
+            job.lease_until = now() - timedelta(seconds=1)
+            snapshot.status = "indexing"  # A previously interrupted legacy rebuild.
+        sid, cid, jid = snapshot.id, chunks[0].id, job.id
+        original_report = dict(snapshot.index_report)
+        db.commit()
+        if failure == "expired_lease":
+            assert jobs.claim(db) is None
+    if failure != "expired_lease":
+        jobs.process(jid, "owner")
+    with SessionLocal() as db:
+        snapshot = db.get(Snapshot, sid)
+        assert (snapshot.status, snapshot.index_version, snapshot.summary) == ("ready", 2, {"purpose": "cached"})
+        assert snapshot.error_code is None and snapshot.index_report == original_report
+        assert db.get(Chunk, cid).text == "source 0"
+        assert db.get(Job, jid).status == "failed"
+        assert db.get(Job, jid).error_code == code
+
+
+@pytest.mark.parametrize("phase", ["directory_summary", "final_summary", "expired_final_summary", "stale_failure"])
+def test_rebuild_rechecks_lease_after_summary_provider(monkeypatch, phase):
+    from app.models import SnapshotNode
+
+    monkeypatch.setattr(jobs.settings, "index_schema_version", 3)
+    monkeypatch.setattr(jobs.settings, "gemini_api_key", "")
+    monkeypatch.setattr(jobs, "download_archive", lambda *_: make_zip("root/replacement.py", "replacement_value = 42"))
+    with SessionLocal() as db:
+        snapshot, _chunks, job = embedding_fixture(db, 1)
+        sid, jid = snapshot.id, job.id
+
+    def steal(*_, **__):
+        with SessionLocal() as other:
+            job = other.get(Job, jid)
+            job.lease_until = now() - timedelta(seconds=1)
+            other.commit()
+            if phase != "expired_final_summary":
+                assert jobs.claim(other)[0] == jid
+        if phase == "stale_failure":
+            raise AppError("unsafe_archive", "Stale worker failed", 400)
+        return {"purpose": "stale", "summaries": [{"path": "", "summary": "stale"}]}
+
+    if phase == "directory_summary":
+        monkeypatch.setattr(rag, "generate_json", steal)
+    else:
+        monkeypatch.setattr(jobs, "make_summary", steal)
+    jobs.process(jid, "owner")
+    with SessionLocal() as db:
+        snapshot = db.get(Snapshot, sid)
+        assert snapshot.index_version == 2 and snapshot.summary == {"purpose": "cached"}
+        job = db.get(Job, jid)
+        assert job.status == "running" and job.error_code is None
+        assert (job.lease_token == "owner") == (phase == "expired_final_summary")
+        root = db.scalar(select(SnapshotNode).where(SnapshotNode.snapshot_id == sid,
+                        SnapshotNode.index_version == 3, SnapshotNode.path == ""))
+        assert "stale" not in root.summary
+
+
+def test_embedding_repair_failure_keeps_published_vectors(monkeypatch):
+    from app.models import ChunkEmbedding
+
+    monkeypatch.setattr(jobs.settings, "gemini_api_key", "mock-only-key")
+    with SessionLocal() as db:
+        snapshot, chunks, job = embedding_fixture(db, 1)
+        vector = ChunkEmbedding(chunk_id=chunks[0].id, model="previous-model", values=[1.0] + [0.0] * 767)
+        db.add(vector)
+        db.commit()
+        sid, cid, eid, jid = snapshot.id, chunks[0].id, vector.id, job.id
+        original_report = dict(snapshot.index_report)
+
+    def fail(*_, **__):
+        with SessionLocal() as reader:
+            assert reader.get(ChunkEmbedding, eid).chunk_id == cid
+            assert reader.get(Snapshot, sid).index_report == original_report
+        raise AppError("embedding_rate_limit", "Replacement failed", 503)
+
+    monkeypatch.setattr(jobs, "embed_texts", fail)
+    jobs.process(jid, "owner")
+    with SessionLocal() as db:
+        assert db.get(Job, jid).status == "queued"
+        assert db.get(Job, jid).error_code == "embedding_rate_limit"
+        snapshot = db.get(Snapshot, sid)
+        assert (snapshot.status, snapshot.index_report) == ("ready", original_report)
+        assert db.get(ChunkEmbedding, eid).chunk_id == cid
 
 
 def test_embedding_migration_invalidates_legacy_and_schedules_repairs():
@@ -461,7 +683,6 @@ def test_authenticated_end_to_end_contract(monkeypatch):
     monkeypatch.setattr(jobs, "download_archive", lambda *_args: make_zip("root/app.py", "def answer(): return 42"))
     monkeypatch.setattr(jobs, "make_summary", lambda *_args: {"purpose": "A test project", "components": [], "entrypoints": ["app.py"], "technologies": ["Python"], "uncertainty": "", "suggestedQuestions": []})
     monkeypatch.setattr(jobs, "summarize_repository_nodes", lambda *_args: None)
-    monkeypatch.setattr(jobs, "_embed_staged_chunks", lambda *_args: False)
     def fake_tool_turn(_instruction, contents, _tools, **_kwargs):
         import re
         text = contents[0]["parts"][0]["text"]

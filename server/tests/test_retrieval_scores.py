@@ -7,7 +7,7 @@ from app.services import retrieval
 def test_hybrid_search_keeps_chunk_only_api_compatible(monkeypatch):
     first = SimpleNamespace(id="first")
     second = SimpleNamespace(id="second")
-    monkeypatch.setattr(retrieval, "hybrid_search_scored", lambda *_args: [(first, 0.08), (second, 0.06)])
+    monkeypatch.setattr(retrieval, "hybrid_search_scored", lambda *_args, **_kwargs: [(first, 0.08), (second, 0.06)])
     assert retrieval.hybrid_search(None, "snapshot", "question", 2) == [first, second]
 
 

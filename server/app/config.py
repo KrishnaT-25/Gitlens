@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     email_from: str = "GitLens <login@example.com>"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.5-flash-lite"
+    gemini_max_retries: int = 2
+    gemini_retry_base_seconds: float = 1
+    gemini_retry_max_seconds: float = 8
     gemini_embedding_model: str = "gemini-embedding-2"
     embedding_dimensions: int = 768
     embedding_batch_size: int = 32
@@ -24,10 +27,14 @@ class Settings(BaseSettings):
     max_summary_calls: int = 4
     index_schema_version: int = 2
     max_repo_map_chars: int = 12000
+    chat_map_chars: int = 4000
+    chat_simple_thinking: str = "minimal"
+    chat_complex_thinking: str = "medium"
     max_tool_output_chars: int = 12000
     max_tool_file_lines: int = 200
     max_agent_turns: int = 4
     max_agent_tool_calls: int = 6
+    chat_timeout_seconds: float = 60
     github_token: str = ""
     github_oauth_client_id: str = ""
     github_oauth_client_secret: str = ""
@@ -61,6 +68,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production(self):
+        if self.index_schema_version < 1:
+            raise ValueError("INDEX_SCHEMA_VERSION must be positive")
         if self.database_url.startswith("postgresql://"):
             self.database_url = self.database_url.replace("postgresql://", "postgresql+psycopg://", 1)
         if self.max_chunks < 1 or self.max_context_chunks < self.max_chunks or self.max_context_chars < 1 or self.max_chunks_per_snapshot < 1 or self.max_symbol_references < 1:
@@ -74,6 +83,14 @@ class Settings(BaseSettings):
             raise ValueError("Embedding request limits are invalid")
         if not 1 <= self.max_agent_turns <= 4 or not 1 <= self.max_agent_tool_calls <= 6 or self.max_tool_file_lines < 1 or self.max_tool_output_chars < 1000 or self.max_repo_map_chars < 1000:
             raise ValueError("Agent limits are invalid")
+        if not 1 <= self.chat_timeout_seconds <= 60:
+            raise ValueError("CHAT_TIMEOUT_SECONDS must be between 1 and 60; the extension waits 70 seconds")
+        if not 1000 <= self.chat_map_chars <= 12000:
+            raise ValueError("CHAT_MAP_CHARS must be between 1000 and 12000")
+        if any(level not in {"minimal", "low", "medium", "high"} for level in (self.chat_simple_thinking, self.chat_complex_thinking)):
+            raise ValueError("Chat thinking levels are invalid")
+        if not 0 <= self.gemini_max_retries <= 3 or not 0 < self.gemini_retry_base_seconds <= self.gemini_retry_max_seconds <= 30:
+            raise ValueError("Gemini retry limits are invalid")
         if self.db_connect_attempts < 1 or self.db_connect_backoff_seconds < 0 or self.db_connect_timeout_seconds < 1 or self.worker_shutdown_timeout_seconds < 0:
             raise ValueError("Database retry and shutdown limits are invalid")
         if self.worker_mode not in {"separate", "inprocess", "actions"}:

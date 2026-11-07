@@ -3,7 +3,9 @@ import hmac
 import json
 import time
 import uuid
-from contextlib import asynccontextmanager
+import anyio
+from contextlib import asynccontextmanager, contextmanager
+from typing import Literal
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,9 +13,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text, select, func
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import DBAPIError
 from app.config import settings
 from app.adapters.embeddings import semantic_status
 from app.db import get_db
+from app.deadlines import chat_deadline, bounded_seconds, check_deadline, timeout_error
 from app.errors import AppError, app_error_handler
 from app.models import User, Job, Snapshot, now
 from app.quotas import consume
@@ -21,7 +25,7 @@ from app.services.auth import authenticate, github_sign_in, logout, request_code
 from app.quotas import ip_scope
 from app.services.snapshots import submit, get_snapshot, retry_snapshot
 from app.services.jobs import kick
-from app.services.rag import answer, answerable_suggestions
+from app.services.rag import MAX_ANSWER_CHARS, answer, answerable_suggestions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -73,11 +77,22 @@ class GithubExchange(BaseModel):
 class RepoRequest(BaseModel):
     url: str = Field(max_length=2000)
 class HistoryTurn(BaseModel):
-    role: str
-    content: str = Field(max_length=2000)
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=max(MAX_ANSWER_CHARS, settings.max_question_chars))
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=settings.max_question_chars)
     history: list[HistoryTurn] = Field(default_factory=list, max_length=settings.max_history_turns)
+
+    @field_validator("history")
+    @classmethod
+    def bounded_history(cls, turns: list[HistoryTurn]) -> list[HistoryTurn]:
+        for turn in turns:
+            limit = MAX_ANSWER_CHARS if turn.role == "assistant" else settings.max_question_chars
+            if len(turn.content) > limit:
+                raise ValueError("History message is too long for its role")
+        if sum(len(turn.content) for turn in turns) > settings.max_question_chars + MAX_ANSWER_CHARS:
+            raise ValueError("Combined history is too long")
+        return turns
 
     @field_validator("question")
     @classmethod
@@ -176,11 +191,32 @@ def snapshot_summary(snapshot_id: str, _user: User = Depends(current_user), db: 
     return {"sha": s.sha, "summary": summary}
 
 @app.post("/api/snapshots/{snapshot_id}/chat")
-def snapshot_chat(snapshot_id: str, body: ChatRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    s = get_snapshot(db, snapshot_id)
-    if s.status != "ready":
-        raise AppError("not_ready", "Repository analysis is not ready.", 409)
-    consume(db, f"user:{user.id}", "chats", settings.daily_user_chats)
-    consume(db, "global", "chats", settings.daily_global_chats)
-    db.commit()
-    return answer(db, s, body.question.strip(), [h.model_dump() for h in body.history])
+async def snapshot_chat(snapshot_id: str, body: ChatRequest, token: str | None = Depends(bearer)):
+    with chat_deadline(settings.chat_timeout_seconds):
+        try:
+            # Own the session inside the thread. On timeout the response can finish
+            # without closing a session that an in-flight operation is still using.
+            with anyio.fail_after(bounded_seconds(settings.chat_timeout_seconds)):
+                return await anyio.to_thread.run_sync(_chat_work, snapshot_id, body, token, abandon_on_cancel=True)
+        except TimeoutError as exc:
+            raise timeout_error() from exc
+
+
+def _chat_work(snapshot_id: str, body: ChatRequest, token: str | None) -> dict:
+    check_deadline()
+    try:
+        with contextmanager(get_db)() as db:
+            user = authenticate(db, token)
+            s = get_snapshot(db, snapshot_id)
+            if s.status != "ready":
+                raise AppError("not_ready", "Repository analysis is not ready.", 409)
+            consume(db, f"user:{user.id}", "chats", settings.daily_user_chats)
+            consume(db, "global", "chats", settings.daily_global_chats)
+            db.commit()
+            result = answer(db, s, body.question.strip(), [h.model_dump() for h in body.history])
+            check_deadline()
+            return result
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) == "57014":
+            raise timeout_error() from exc
+        raise
