@@ -33,11 +33,27 @@ test('renders lists and links only references with verified citations', async ()
     repo: { owner: 'o', name: 'r' }, sha: 'abc',
   });
   expect(view.querySelectorAll('.answer-content > ul li')).toHaveLength(2);
-  expect(view.querySelectorAll('.answer-content > p .file-chip, .answer-content > ul .file-chip')).toHaveLength(2);
+  expect(view.querySelectorAll('.answer-content > p .file-chip, .answer-content > ul .file-chip')).toHaveLength(3);
   expect(view.querySelector('.answer-content > p code').textContent).toBe('Socket.IO');
   expect(view.querySelector('.file-chip[href*="models.py"]')?.getAttribute('href')).toContain('https://github.com/o/r/blob/abc/server/app/models.py');
   expect(view.querySelector('strong')).not.toBeNull();
   expect(view.querySelector('.answer-content').textContent).not.toContain('**');
+});
+
+test('keeps slash-separated terms as text and links verified extensionless files and directories', async () => {
+  const view = await renderAnswer({
+    content: 'BM25/FTS and `HTTP/HTTPS` are terms. See `README:L1`, `src/bin`, and `missing/path`.',
+    citations: [
+      { path: 'README', lineStart: 1, lineEnd: 2, url: 'https://github.com/o/r/blob/abc/README#L1-L2' },
+      { path: 'src/bin/run', lineStart: 1, lineEnd: 2, url: 'https://github.com/o/r/blob/abc/src/bin/run#L1-L2' },
+    ],
+    repo: { owner: 'o', name: 'r' }, sha: 'abc',
+  });
+  expect(view.querySelector('.answer-content > p').textContent).toContain('BM25/FTS and HTTP/HTTPS');
+  expect([...view.querySelectorAll('.answer-content > p a')].map(link => link.href)).toEqual([
+    'https://github.com/o/r/blob/abc/README#L1-L2',
+    'https://github.com/o/r/tree/abc/src/bin',
+  ]);
 });
 
 test('uses the matching excerpt when a file has multiple citations', async () => {

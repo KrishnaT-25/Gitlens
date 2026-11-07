@@ -1,11 +1,13 @@
-const REPOSITORY_REFERENCE = /(?<![\w@./:-])((?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\/?|[A-Za-z0-9_.-]+\.[A-Za-z0-9_-]+)(?::L?(\d+)(?:-L?(\d+))?)?(?![\w/.-])/g;
-
-export function parseFileReferences(text) {
+export function parseFileReferences(text, verifiedPaths = []) {
+  const paths = [...new Set(verifiedPaths)].filter(path => path && !path.split('/').some(segment => segment === '.' || segment === '..'));
+  if (!paths.length) return [];
+  const alternatives = paths.sort((a, b) => b.length - a.length)
+    .map(path => path.replace(/[.*+?^$(){}|[\]\\]/g, '\\$&')).join('|');
+  const pattern = new RegExp('(?<![\\w@./:-])(' + alternatives +
+    ')(?::L?(\\d+)(?:-L?(\\d+))?)?(?![\\w/:-]|\\.[\\w.-])', 'g');
   const references = [];
-  REPOSITORY_REFERENCE.lastIndex = 0;
-  for (const match of text.matchAll(REPOSITORY_REFERENCE)) {
+  for (const match of text.matchAll(pattern)) {
     const path = match[1];
-    if (path.split('/').some(segment => segment === '.' || segment === '..')) continue;
     references.push({
       start: match.index,
       end: match.index + match[0].length,

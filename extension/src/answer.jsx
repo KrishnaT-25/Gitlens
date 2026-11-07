@@ -1,7 +1,7 @@
 import { Children, cloneElement, isValidElement, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { deduplicateSources, parseFileReferences } from './references.js';
+import { deduplicateSources, githubFileUrl, parseFileReferences } from './references.js';
 
 function plainText(node) {
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -51,25 +51,45 @@ function safeMarkdownUrl(value) {
   }
 }
 
-export function AnswerMessage({ content, citations = [], sha }) {
+export function AnswerMessage({ content, citations = [], repo, sha }) {
   const [feedback, setFeedback] = useState('');
   const sources = deduplicateSources(citations);
+  const directories = new Map();
+  for (const source of sources) {
+    if (!safeMarkdownUrl(source.url)) continue;
+    const parts = source.path.split('/');
+    for (let depth = 1; depth < parts.length; depth++) {
+      const path = parts.slice(0, depth).join('/');
+      const url = githubFileUrl({ path: path + '/' }, repo, sha);
+      if (url) {
+        directories.set(path, url);
+        directories.set(path + '/', url);
+      }
+    }
+  }
+  const verifiedPaths = [...sources.map(source => source.path), ...directories.keys()];
 
   function citedSource(reference) {
     const matches = sources.filter(source => source.path === reference.path);
-    if (!reference.lineStart) return matches.length === 1 ? matches[0] : undefined;
+    if (reference.lineStart == null) {
+      if (matches.length === 1) return matches[0];
+      if (matches.length === 0 && directories.has(reference.path)) return { url: directories.get(reference.path) };
+      return undefined;
+    }
+    if (!Number.isSafeInteger(reference.lineStart) || reference.lineStart < 1 ||
+        !Number.isSafeInteger(reference.lineEnd) || reference.lineEnd < reference.lineStart) return undefined;
     return matches.find(source => source.lineStart <= reference.lineStart &&
       source.lineEnd >= (reference.lineEnd ?? reference.lineStart));
   }
 
   function fileChip(reference) {
-    const href = citedSource(reference)?.url;
+    const href = safeMarkdownUrl(citedSource(reference)?.url);
     if (!href) return reference.text;
     return <a className="file-chip" href={href} target="_blank" rel="noopener noreferrer" title={`Open ${reference.text}`} aria-label={`Open ${reference.text} on GitHub`}><span aria-hidden="true">▤</span>{reference.text}</a>;
   }
 
   function renderReferences(text) {
-    const references = parseFileReferences(text).filter(reference => citedSource(reference)?.url);
+    const references = parseFileReferences(text, verifiedPaths).filter(reference => safeMarkdownUrl(citedSource(reference)?.url));
     if (!references.length) return text;
     const output = [];
     let offset = 0;
@@ -97,8 +117,9 @@ export function AnswerMessage({ content, citations = [], sha }) {
 
   function InlineCode({ className, children, ...props }) {
     const text = plainText(children).replace(/\n$/, '');
-    const refs = parseFileReferences(text);
-    if (!className && refs.length === 1 && refs[0].start === 0 && refs[0].end === text.length && citedSource(refs[0])?.url) return fileChip(refs[0]);
+    const refs = parseFileReferences(text, verifiedPaths);
+    if (!className && refs.length === 1 && refs[0].start === 0 && refs[0].end === text.length &&
+        safeMarkdownUrl(citedSource(refs[0])?.url)) return fileChip(refs[0]);
     return <code className={className} {...props}>{children}</code>;
   }
 

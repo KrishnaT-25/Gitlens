@@ -2,16 +2,17 @@ import { expect, test } from 'vitest';
 import { deduplicateSources, githubFileUrl, parseFileReferences } from './references.js';
 
 test('finds paths and line ranges in prose without parsing URLs', () => {
-  const references = parseFileReferences('See server/app/db.py:L1-L10, `README.md:2`, and server/app/; https://github.com/owner/repo/blob/main/not/a-reference.py');
+  const references = parseFileReferences('See server/app/db.py:L1-L10, `README:2`, and server/app/. Use BM25/FTS or HTTP/HTTPS. https://github.com/o/r/blob/main/server/app/db.py',
+    ['server/app/db.py', 'README', 'server/app/']);
   expect(references.map(({ path, lineStart, lineEnd }) => [path, lineStart, lineEnd])).toEqual([
     ['server/app/db.py', 1, 10],
-    ['README.md', 2, 2],
+    ['README', 2, 2],
     ['server/app/', null, null],
   ]);
 });
 
 test('does not accept traversal references and handles single-line syntax', () => {
-  const references = parseFileReferences('../secret.py and src/db.py:12');
+  const references = parseFileReferences('../secret.py and src/db.py:12', ['../secret.py', 'secret.py', 'src/db.py']);
   expect(references.map(ref => [ref.path, ref.lineStart, ref.lineEnd])).toEqual([['src/db.py', 12, 12]]);
 });
 
