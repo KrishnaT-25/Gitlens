@@ -32,6 +32,7 @@ test('one widget follows GitHub navigation and closes with Escape', async () => 
   host.shadowRoot.querySelector('.panel').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   await tick();
   expect(host.shadowRoot.querySelector('.panel')).toBeNull();
+  expect(host.shadowRoot.activeElement).toBe(host.shadowRoot.querySelector('.launcher'));
   history.pushState({}, '', '/settings/profile');
   dispatchEvent(new Event('turbo:load'));
   await tick();
